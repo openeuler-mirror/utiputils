@@ -1,0 +1,29 @@
+[package]
+name = "utiputils"
+version = "0.0.1"
+edition = "2021"
+autobins = false
+license = "GPL-2.0-or-later"
+
+[dependencies]
+
+
+[[bin]]
+name = "utping"
+path = "src/bin/ping.rs"
+
+[[bin]]
+name = "utarping"
+path = "src/bin/arping.rs"
+
+[[bin]]
+name = "utclockdiff"
+path = "src/bin/clockdiff.rs"
+
+[[bin]]
+name = "uttracepath"
+path = "src/bin/tracepath.rs"
+
+[[bin]]
+name = "utifenslave"
+path = "src/bin/ifenslave.rs"
