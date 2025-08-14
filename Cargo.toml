@@ -6,7 +6,10 @@ autobins = false
 license = "GPL-2.0-or-later"
 
 [dependencies]
-
+anyhow = "1.0.95"
+env_logger = { version="0.11.6", features = ["color"]}
+log = "0.4.25"
+chrono = "0.4.39"
 
 [[bin]]
 name = "utping"
