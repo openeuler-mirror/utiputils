@@ -4,9 +4,4 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-// 核心功能模块
-pub mod common;
-pub mod core;
-
-// 工具模块
-pub mod tools;
+pub mod config;
