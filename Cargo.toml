@@ -18,6 +18,7 @@ rtnetlink = "0.16.0"
 tokio = { version = "1.40.0", features = ["rt", "macros"] }
 mac_address = "1.1.8"
 pnet = "0.35.0"
+trust-dns-resolver = "0.22.0"
 
 [[bin]]
 name = "utping"
