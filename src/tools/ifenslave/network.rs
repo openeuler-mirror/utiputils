@@ -120,6 +120,108 @@ impl NetworkInterface {
 
         Ok(())
     }
+
+    // Get interface MAC address
+    pub async fn get_interface_mac(&self, name: &str) -> Result<MacAddress, Error> {
+        let link = self.get_link_info(name).await?;
+
+        for nla in link.attributes.iter() {
+            if let LinkAttribute::Address(addr) = nla {
+                if addr.len() == 6 {
+                    let mut address = [0u8; 6];
+                    address.copy_from_slice(&addr[..6]);
+
+                    if let Ok(mac) = MacAddress::from_str(&format!(
+                        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        address[0], address[1], address[2], address[3], address[4], address[5]
+                    )) {
+                        if self.verbose {
+                            println!("Interface '{}': MAC address is {}", name, mac);
+                        }
+                        return Ok(mac);
+                    }
+                }
+            }
+        }
+
+        Err(Error::InvalidAddress(vec![], vec![]))
+    }
+
+    // Set interface MAC address
+    pub async fn set_interface_mac(&self, name: &str, mac: &MacAddress) -> Result<(), Error> {
+        // Convert MacAddress to byte array
+        let mac_bytes = mac.bytes().to_vec();
+
+        let index = self.get_link_index(name).await?;
+        let mut link_message = LinkMessage::default();
+        link_message.header.index = index;
+        link_message
+            .attributes
+            .push(LinkAttribute::Address(mac_bytes));
+
+        self.handle.link().set(link_message).execute().await?;
+
+        if self.verbose {
+            println!("Interface '{}': MAC address set to {}", name, mac);
+        }
+
+        Ok(())
+    }
+
+    // Get interface MTU
+    pub async fn get_interface_mtu(&self, name: &str) -> Result<u32, Error> {
+        let link = self.get_link_info(name).await?;
+
+        if let Some(mtu) = link.attributes.iter().find_map(|attr| {
+            if let LinkAttribute::Mtu(mtu) = attr {
+                Some(*mtu)
+            } else {
+                None
+            }
+        }) {
+            if self.verbose {
+                println!("Interface '{}': MTU is {}", name, mtu);
+            }
+            return Ok(mtu);
+        }
+
+        Err(Error::RequestFailed)
+    }
+
+    // Set interface MTU
+    pub async fn set_interface_mtu(&self, name: &str, mtu: u32) -> Result<(), Error> {
+        let index = self.get_link_index(name).await?;
+
+        let mut link_message = LinkMessage::default();
+        link_message.header.index = index;
+        link_message.attributes.push(LinkAttribute::Mtu(mtu));
+
+        self.handle.link().set(link_message).execute().await?;
+
+        if self.verbose {
+            println!("Interface '{}': MTU set to {}", name, mtu);
+        }
+
+        Ok(())
+    }
+
+    // Enable interface
+    pub async fn set_interface_up(&self, name: &str) -> Result<(), Error> {
+        let index = self.get_link_index(name).await?;
+
+        let mut link_message = LinkMessage::default();
+        link_message.header.index = index;
+        link_message.header.flags |= LinkFlags::Up;
+        link_message.header.change_mask |= LinkFlags::Up;
+
+        self.handle.link().set(link_message).execute().await?;
+
+        if self.verbose {
+            println!("Interface '{}': Enabled", name);
+        }
+
+        Ok(())
+    }
 }
 
 // Get bonding ABI version
