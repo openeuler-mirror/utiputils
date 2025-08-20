@@ -80,3 +80,73 @@ pub fn resolve_ipv4_addr(ipstring: &str) -> Result<(String, Vec<Ipv4Addr>), anyh
         }
     }
 }
+
+/// 反向DNS查询，支持IPv4和IPv6
+pub fn reverse_dns_lookup(ip: &str) -> Result<String, anyhow::Error> {
+    // 解析 IP 地址
+    let ip_addr: IpAddr = ip
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid IP address"))?;
+
+    // 根据IP类型构建对应的sockaddr结构
+    let (sockaddr_ptr, sockaddr_len) = match ip_addr {
+        IpAddr::V4(ipv4) => {
+            let addr = libc::sockaddr_in {
+                sin_family: libc::AF_INET as u16,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(ipv4).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            (
+                &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        IpAddr::V6(ipv6) => {
+            let addr = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as u16,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr {
+                    s6_addr: ipv6.octets(),
+                },
+                sin6_scope_id: 0,
+            };
+            (
+                &addr as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    };
+
+    // 调用 getnameinfo
+    let mut host_buf = [0u8; 1024];
+    let mut service_buf = [0u8; 1024];
+    let result = unsafe {
+        libc::getnameinfo(
+            sockaddr_ptr,
+            sockaddr_len,
+            host_buf.as_mut_ptr() as *mut libc::c_char,
+            host_buf.len() as libc::socklen_t,
+            service_buf.as_mut_ptr() as *mut libc::c_char,
+            service_buf.len() as libc::socklen_t,
+            libc::NI_NAMEREQD,
+        )
+    };
+
+    if result != 0 {
+        debug!("getnameinfo failed: {}", result);
+        return Ok(ip.to_string());
+    }
+
+    // 提取主机名
+    let host = unsafe {
+        std::ffi::CStr::from_ptr(host_buf.as_ptr() as *const libc::c_char)
+            .to_string_lossy()
+            .into_owned()
+    };
+    debug!("reverse DNS lookup: {} -> {}", ip, host);
+    Ok(host)
+}
