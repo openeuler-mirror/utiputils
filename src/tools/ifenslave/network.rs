@@ -222,6 +222,122 @@ impl NetworkInterface {
 
         Ok(())
     }
+
+    // Disable interface
+    pub async fn set_interface_down(&self, name: &str) -> Result<(), Error> {
+        let index = self.get_link_index(name).await?;
+
+        let mut link_message = LinkMessage::default();
+        link_message.header.index = index;
+        link_message.header.flags &= !LinkFlags::Up;
+        link_message.header.change_mask |= LinkFlags::Up;
+
+        self.handle.link().set(link_message).execute().await?;
+
+        if self.verbose {
+            println!("Interface '{}': Disabled", name);
+        }
+
+        Ok(())
+    }
+
+    // Clear interface IP address
+    pub async fn clear_interface_address(&self, name: &str) -> Result<(), Error> {
+        let index = self.get_link_index(name).await?;
+        let mut addresses = self
+            .handle
+            .address()
+            .get()
+            .set_link_index_filter(index)
+            .execute();
+
+        while let Some(addr) = addresses.try_next().await? {
+            if addr.header.family == AddressFamily::Inet {
+                self.handle.address().del(addr).execute().await?;
+            }
+        }
+
+        if self.verbose {
+            println!("Interface '{}': Address cleared", name);
+        }
+
+        Ok(())
+    }
+
+    // Copy IP configuration from master interface to slave interface
+    pub async fn copy_address_config(&self, master: &str, slave: &str) -> Result<(), Error> {
+        let master_index = self.get_link_index(master).await?;
+        let slave_index = self.get_link_index(slave).await?;
+
+        let mut addresses = self
+            .handle
+            .address()
+            .get()
+            .set_link_index_filter(master_index)
+            .execute();
+
+        // Collect all addresses of the master interface
+        let mut addr_configs = Vec::new();
+        while let Some(_addr) = addresses.next().await {
+            while let Some(addr) = addresses.try_next().await? {
+                if addr.header.family == AddressFamily::Inet {
+                    addr_configs.push(addr);
+                }
+            }
+        }
+
+        // Clear the addresses of the slave interface first
+        self.clear_interface_address(slave).await?;
+
+        // Apply the addresses of the master interface to the slave interface
+        for addr in addr_configs {
+            let mut address_message = addr.clone();
+            address_message.header.index = slave_index;
+            let address = addr
+                .attributes
+                .iter()
+                .find_map(|attr| {
+                    if let AddressAttribute::Address(addr) = attr {
+                        Some(addr)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let prefix_len = addr.header.prefix_len;
+            self.handle
+                .address()
+                .add(slave_index, *address, prefix_len)
+                .execute()
+                .await?;
+
+            if self.verbose {
+                if let Some(local) = addr.attributes.iter().find_map(|attr| {
+                    if let AddressAttribute::Address(addr) = attr {
+                        Some(addr)
+                    } else {
+                        None
+                    }
+                }) {
+                    println!("Interface '{}': Set IP address to {}", slave, local);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // Check the MAC address status of the master interface
+    pub async fn check_master_hwaddr(&mut self, master: &str) -> Result<(), Error> {
+        let mac = self.get_interface_mac(master).await?;
+        let zero_mac = MacAddress::from_str("00:00:00:00:00:00").unwrap();
+
+        if mac != zero_mac {
+            self.hwaddr_set = true;
+        }
+
+        Ok(())
+    }
 }
 
 // Get bonding ABI version
