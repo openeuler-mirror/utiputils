@@ -20,6 +20,7 @@ tokio = { version = "1.40.0", features = ["rt", "macros"] }
 mac_address = "1.1.8"
 pnet = "0.35.0"
 trust-dns-resolver = "0.22.0"
+socket2 ={ version="0.5.8", features = ["all"]}
 
 [[bin]]
 name = "utping"
