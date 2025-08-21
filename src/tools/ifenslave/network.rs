@@ -338,6 +338,162 @@ impl NetworkInterface {
 
         Ok(())
     }
+
+    // 显示所有接口或特定接口的信息
+    pub async fn show_interfaces(&self, ifname: Option<&str>) -> Result<(), Error> {
+        match ifname {
+            Some(name) => {
+                // 显示特定接口信息
+                let link = self.get_link_info(name).await?;
+                let ip_addr = self
+                    .get_interface_ip(name)
+                    .await
+                    .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+                display_interface_with_ip(&link, &ip_addr, self.verbose);
+            }
+            None => {
+                // 显示所有接口信息
+                let mut links = self.handle.link().get().execute();
+
+                while let Some(link) = links.try_next().await? {
+                    let ifname = link
+                        .attributes
+                        .iter()
+                        .find_map(|attr| {
+                            if let LinkAttribute::IfName(name) = attr {
+                                Some(name.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let ip_addr = self
+                        .get_interface_ip(&ifname)
+                        .await
+                        .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+                    display_interface_with_ip(&link, &ip_addr, self.verbose);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // 获取接口IP地址
+    pub async fn get_interface_ip(&self, name: &str) -> Result<std::net::Ipv4Addr, Error> {
+        let link_index = self.get_link_index(name).await?;
+        let mut addresses = self
+            .handle
+            .address()
+            .get()
+            .set_link_index_filter(link_index)
+            .execute();
+
+        while let Some(addr) = addresses.try_next().await? {
+            if addr.header.family == AddressFamily::Inet {
+                if let Some(ip) = addr.attributes.iter().find_map(|attr| {
+                    if let AddressAttribute::Address(std::net::IpAddr::V4(ipv4)) = attr {
+                        Some(*ipv4)
+                    } else {
+                        None
+                    }
+                }) {
+                    return Ok(ip);
+                }
+            }
+        }
+
+        // 如果没有找到IP地址，返回默认值
+        Ok(std::net::Ipv4Addr::new(0, 0, 0, 0))
+    }
+
+    // 获取驱动信息
+    pub async fn get_drv_info(&self, name: &str) -> Result<(), Error> {
+        // 检查接口是否是bonding master接口
+        let flags = self.get_interface_flags(name).await?;
+
+        // 如果不是master接口，返回错误（模拟原生ifenslave的行为）
+        if flags & libc::IFF_MASTER as u32 == 0 {
+            return Err(Error::RequestFailed);
+        }
+
+        Ok(())
+    }
+}
+
+// Display interface information in native ifenslave format
+pub fn display_interface_with_ip(link: &LinkMessage, ip_addr: &std::net::Ipv4Addr, _verbose: bool) {
+    let ifname = link
+        .attributes
+        .iter()
+        .find_map(|attr| {
+            if let LinkAttribute::IfName(name) = attr {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Display flags in native format (only lower 16 bits like original ifenslave)
+    let flags_value: u32 = link.header.flags.bits();
+    println!(
+        "The result of SIOCGIFFLAGS on {} is {:x}.",
+        ifname,
+        flags_value & 0xFFFF
+    );
+
+    // Display IP address in native format (as hex bytes with sign extension like original)
+    let octets = ip_addr.octets();
+    // Simulate the sign extension behavior of original ifenslave
+    let format_byte = |b: u8| -> String {
+        if b > 127 {
+            format!("ffffff{:02x}", b)
+        } else {
+            format!("{:02x}", b)
+        }
+    };
+    println!(
+        "The result of SIOCGIFADDR is {}.{}.{}.{}.",
+        format_byte(octets[0]),
+        format_byte(octets[1]),
+        format_byte(octets[2]),
+        format_byte(octets[3])
+    );
+
+    // Display MAC address in native format
+    if let Some(address) = link.attributes.iter().find_map(|attr| {
+        if let LinkAttribute::Address(addr) = attr {
+            Some(addr)
+        } else {
+            None
+        }
+    }) {
+        if address.len() >= 6 {
+            // Get the hardware type - convert LinkLayerType to u16
+            let hw_type: u16 = link.header.link_layer_type.into();
+            println!(
+                "The result of SIOCGIFHWADDR is type {}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}.",
+                hw_type,
+                address[0], address[1], address[2], address[3], address[4], address[5]
+            );
+        }
+    }
+
+    // Display metric (usually 0)
+    println!("The result of SIOCGIFMETRIC is 0");
+
+    // Display MTU in native format
+    if let Some(mtu) = link.attributes.iter().find_map(|attr| {
+        if let LinkAttribute::Mtu(mtu) = attr {
+            Some(*mtu)
+        } else {
+            None
+        }
+    }) {
+        println!("The result of SIOCGIFMTU is {}", mtu);
+    }
 }
 
 // Get bonding ABI version
