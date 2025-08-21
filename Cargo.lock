@@ -1513,6 +1513,7 @@ dependencies = [
  "mac_address",
  "pnet",
  "rtnetlink",
+ "socket2 0.5.10",
  "tokio",
  "trust-dns-resolver",
 ]
