@@ -4,5 +4,6 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+pub mod bonding;
 pub mod config;
 pub mod network;
