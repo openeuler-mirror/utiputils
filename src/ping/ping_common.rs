@@ -75,7 +75,6 @@ fn get_timestamp_ms() -> u32 {
     now.as_secs() as u32
 }
 
-
 /// 判断IPv6地址是否为链路本地地址
 fn is_ipv6_link_local(ipv6: &std::net::Ipv6Addr) -> bool {
     // IPv6链路本地地址前缀为 fe80::/10
