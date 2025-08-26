@@ -74,3 +74,48 @@ fn get_timestamp_ms() -> u32 {
     // 这样更接近原生ping的行为，且能被tshark识别为时间戳
     now.as_secs() as u32
 }
+
+
+/// 判断IPv6地址是否为链路本地地址
+fn is_ipv6_link_local(ipv6: &std::net::Ipv6Addr) -> bool {
+    // IPv6链路本地地址前缀为 fe80::/10
+    let segments = ipv6.segments();
+    (segments[0] & 0xffc0) == 0xfe80
+}
+
+/// 获取IPv6链路本地地址对应的接口名
+fn get_interface_for_link_local(ipv6: &std::net::Ipv6Addr) -> String {
+    use pnet::datalink;
+
+    // 获取所有网络接口
+    let interfaces = datalink::interfaces();
+
+    for interface in interfaces {
+        // 检查接口的IPv6地址
+        for ip_network in interface.ips {
+            if let pnet::ipnetwork::IpNetwork::V6(ipv6_network) = ip_network {
+                let interface_ip = ipv6_network.ip();
+                // 比较IPv6地址（忽略范围ID）
+                if &interface_ip == ipv6 {
+                    return interface.name;
+                }
+            }
+        }
+    }
+
+    // 如果找不到匹配的接口，返回默认接口名
+    // 这种情况下，我们尝试找到第一个链路本地地址的接口
+    for interface in datalink::interfaces() {
+        for ip_network in interface.ips {
+            if let pnet::ipnetwork::IpNetwork::V6(ipv6_network) = ip_network {
+                let interface_ip = ipv6_network.ip();
+                if is_ipv6_link_local(&interface_ip) {
+                    return interface.name;
+                }
+            }
+        }
+    }
+
+    // 最后的备选方案
+    "lo".to_string()
+}
