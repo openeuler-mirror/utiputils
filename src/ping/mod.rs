@@ -5,3 +5,4 @@
  */
 
 pub mod ping_common;
+pub mod ping_types;
