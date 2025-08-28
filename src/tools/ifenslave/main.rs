@@ -30,5 +30,86 @@ fn main(opt_args: &IfenslaveConfig) -> Result<(), io::Error> {
         }
     };
 
+    // Handle displaying all interfaces
+    if opt_args.all_interfaces {
+        info!("show all interfaces");
+        if opt_args.interfaces.is_empty() {
+            // Display all interface information
+            return rt.block_on(async {
+                match network.show_interfaces(None).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to display interface information: {:?}", e),
+                    )),
+                }
+            });
+        } else {
+            // Display usage error
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Error: -a option does not accept interface arguments",
+            ));
+        }
+    }
+
+    // Handle case with no arguments
+    if opt_args.interfaces.is_empty() {
+        println!("{}", USAGE_MSG);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "No interface specified",
+        ));
+    }
+    // Get master interface name
+    let master_ifname = opt_args.get_master_interface().unwrap();
+
+    // Get ABI version of the master interface
+    rt.block_on(async {
+        if let Err(_e) = network.get_drv_info(master_ifname).await {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Master '{}': Error: handshake with driver failed. Aborting",
+                    master_ifname
+                ),
+            ));
+        }
+        Ok(())
+    })?;
+
+    // Handle single master interface case (display interface information)
+    if opt_args.is_show_mode() {
+        return rt.block_on(async {
+            match network.show_interfaces(Some(master_ifname)).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "Failed to display information for interface '{}': {:?}",
+                        master_ifname, e
+                    ),
+                )),
+            }
+        });
+    }
+
+    // Check if the master interface is actually a master interface
+    let master_is_master = rt.block_on(async {
+        match network.get_interface_flags(master_ifname).await {
+            Ok(flags) => flags & libc::IFF_MASTER as u32 != 0,
+            Err(_) => false,
+        }
+    });
+
+    if !master_is_master {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Invalid operation: Specified interface '{}' is not a master interface",
+                master_ifname
+            ),
+        ));
+    }
     Ok(())
 }
