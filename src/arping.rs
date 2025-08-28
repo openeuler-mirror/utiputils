@@ -5,6 +5,24 @@
  */
 
 use clap::Parser;
+use log::{debug, error, info};
+
+use pnet::{
+    datalink::{self, Channel, NetworkInterface},
+    packet::{
+        arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket},
+        ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
+        MutablePacket, Packet,
+    },
+    util::MacAddr,
+};
+
+use std::{
+    env,
+    net::{IpAddr, Ipv4Addr},
+    process, thread,
+    time::{Duration, Instant},
+};
 
 // ARP 包结构长度常量
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -67,4 +85,39 @@ pub struct ArpingConfig {
     /// Source IP address to use
     #[arg(short = 's')]
     pub source: Option<String>,
+}
+
+impl ArpingConfig {
+    pub fn from_args() -> Self {
+        Self::parse()
+    }
+}
+
+struct ArgState {
+    target_mac: Option<MacAddr>, // 目标 MAC 地址
+    last_update: Instant,        // 最后更新时间
+}
+
+impl ArgState {
+    fn new() -> Self {
+        ArgState {
+            target_mac: None,
+            last_update: Instant::now(),
+        }
+    }
+
+    // 是否需要发送广播（首次或缓存过期）
+    fn should_broadcast(&self) -> bool {
+        self.target_mac.is_none() || self.last_update.elapsed() > Duration::from_secs(60)
+    }
+
+    // 更新缓存
+    fn update(&mut self, mac: MacAddr) {
+        self.target_mac = Some(mac);
+        self.last_update = Instant::now();
+    }
+
+    fn is_expired(&self, timeout: u32) -> bool {
+        self.last_update.elapsed().as_secs() > timeout as u64
+    }
 }
