@@ -121,3 +121,42 @@ impl ArgState {
         self.last_update.elapsed().as_secs() > timeout as u64
     }
 }
+
+fn validate_ip_on_interface(interface: &NetworkInterface, ip: IpAddr) -> bool {
+    for ip_network in &interface.ips {
+        if ip_network.ip() == ip {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_source_ip_on_interface(interface: &NetworkInterface, source_ip: Ipv4Addr) -> bool {
+    for ip_network in &interface.ips {
+        if let IpAddr::V4(_ipv4) = ip_network.ip() {
+            // 检查源IP是否在同一网络段内
+            if ip_network.contains(IpAddr::V4(source_ip)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn print_summary(sent_count: u32, reply_count: u32, broadcast_count: u32) {
+    println!(
+        "Sent {} probes ({} broadcast(s)) \nReceived {} response(s)",
+        sent_count, broadcast_count, reply_count
+    );
+}
+
+// 工具函数
+fn find_interface(name: &str) -> NetworkInterface {
+    datalink::interfaces()
+        .into_iter()
+        .find(|iface| iface.name == name)
+        .unwrap_or_else(|| {
+            eprintln!("utarping: Interface {} not found", name);
+            process::exit(1);
+        })
+}
