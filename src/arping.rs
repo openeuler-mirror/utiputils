@@ -160,3 +160,92 @@ fn find_interface(name: &str) -> NetworkInterface {
             process::exit(1);
         })
 }
+
+/// 为目标IP地址找到最佳的网络接口
+fn find_best_interface_for_target(target_ip: Ipv4Addr) -> Option<NetworkInterface> {
+    let interfaces = datalink::interfaces();
+
+    // 首先尝试找到与目标IP在同一网段的接口
+    for interface in &interfaces {
+        if !is_interface_suitable(interface) {
+            continue;
+        }
+
+        for ip_network in &interface.ips {
+            if let IpAddr::V4(_ipv4) = ip_network.ip() {
+                // 检查目标IP是否在此接口的网络段内
+                if ip_network.contains(IpAddr::V4(target_ip)) {
+                    debug!(
+                        "Found interface {} for target {} (same network)",
+                        interface.name, target_ip
+                    );
+                    return Some(interface.clone());
+                }
+            }
+        }
+    }
+
+    // 如果没有找到同网段的接口，选择默认路由接口
+    find_default_route_interface(&interfaces).or_else(|| find_first_suitable_interface(&interfaces))
+}
+
+/// 检查接口是否适合用于ARP操作
+fn is_interface_suitable(interface: &NetworkInterface) -> bool {
+    // 跳过回环接口
+    if interface.is_loopback() {
+        return false;
+    }
+
+    // 必须有MAC地址
+    if interface.mac.is_none() {
+        return false;
+    }
+
+    // 必须有IPv4地址
+    let has_ipv4 = interface
+        .ips
+        .iter()
+        .any(|ip| matches!(ip.ip(), IpAddr::V4(_)));
+    if !has_ipv4 {
+        return false;
+    }
+
+    // 接口必须是UP状态
+    if !interface.is_up() {
+        return false;
+    }
+
+    true
+}
+
+/// 尝试找到默认路由接口
+fn find_default_route_interface(interfaces: &[NetworkInterface]) -> Option<NetworkInterface> {
+    // 常见的默认接口名称优先级
+    let preferred_names = ["eth0", "eno1", "enp", "ens", "em1", "wlan0", "wlp", "wlo"];
+
+    for preferred in &preferred_names {
+        for interface in interfaces {
+            if !is_interface_suitable(interface) {
+                continue;
+            }
+
+            if interface.name.starts_with(preferred) {
+                debug!("Selected preferred interface: {}", interface.name);
+                return Some(interface.clone());
+            }
+        }
+    }
+
+    None
+}
+
+/// 找到第一个合适的接口
+fn find_first_suitable_interface(interfaces: &[NetworkInterface]) -> Option<NetworkInterface> {
+    for interface in interfaces {
+        if is_interface_suitable(interface) {
+            debug!("Selected first suitable interface: {}", interface.name);
+            return Some(interface.clone());
+        }
+    }
+    None
+}
