@@ -249,3 +249,100 @@ fn find_first_suitable_interface(interfaces: &[NetworkInterface]) -> Option<Netw
     }
     None
 }
+
+fn get_interface_ip(interface: &NetworkInterface) -> Option<Ipv4Addr> {
+    interface.ips.iter().find_map(|ip| {
+        if let IpAddr::V4(ipv4) = ip.ip() {
+            Some(ipv4)
+        } else {
+            None
+        }
+    })
+}
+
+fn build_arp_packet(
+    options: &mut ArpingConfig,
+    state: &ArgState,
+    src_mac: MacAddr,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+) -> [u8; TOTAL_PACKET_LEN] {
+    let mut buffer = [0u8; TOTAL_PACKET_LEN];
+
+    // 根据目标 MAC 地址是否过期决定是否发送广播
+    let dst_mac = match state.should_broadcast() {
+        true => MacAddr::broadcast(),       // 广播模式
+        false => state.target_mac.unwrap(), // 单播模式
+    };
+
+    // 处理 -A 选项，使用 Reply 类型
+    let operation = if options.arp_answer {
+        ArpOperations::Reply
+    } else {
+        ArpOperations::Request
+    };
+
+    // 构建以太网帧头
+    let mut eth_packet = MutableEthernetPacket::new(&mut buffer).unwrap();
+    eth_packet.set_destination(dst_mac);
+    eth_packet.set_source(src_mac);
+    eth_packet.set_ethertype(EtherTypes::Arp);
+
+    // 构建 ARP 包
+    let mut arp_packet = MutableArpPacket::new(eth_packet.payload_mut()).unwrap();
+    arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+    arp_packet.set_protocol_type(EtherTypes::Ipv4);
+    arp_packet.set_hw_addr_len(6);
+    arp_packet.set_proto_addr_len(4);
+    arp_packet.set_operation(operation);
+    arp_packet.set_sender_hw_addr(src_mac);
+    arp_packet.set_sender_proto_addr(src_ip);
+
+    // 设定目标硬件地址：与 iputils 行为保持一致
+    // 1. 首包（广播）时，target_hw_addr 也使用广播地址 FF:FF:FF:FF:FF:FF
+    //    某些设备在 target_hw_addr 为 00:00:00:00:00:00 时可能不返回应答，
+    //    这会导致收到的 reply 数量比 arping 少 1 次。
+    // 2. 后续单播包则写入已学到的目标 MAC。
+    let target_hw = match state.should_broadcast() {
+        true => MacAddr::broadcast(),
+        false => state.target_mac.unwrap_or(MacAddr::zero()),
+    };
+    arp_packet.set_target_hw_addr(target_hw);
+
+    arp_packet.set_target_proto_addr(dst_ip);
+
+    buffer
+}
+
+fn parse_arp_reply(packet: &[u8], target_ip: Ipv4Addr) -> Option<MacAddr> {
+    // 解析以太网帧
+    let eth_packet = EthernetPacket::new(packet)?;
+
+    // 检查以太网帧的类型是否为 ARP
+    if eth_packet.get_ethertype() != EtherTypes::Arp {
+        // debug!("not arp: {}",eth_packet.get_ethertype());
+        return None;
+    }
+
+    // 解析 ARP 包
+    let arp_packet = ArpPacket::new(eth_packet.payload())?;
+    if arp_packet.get_operation() != ArpOperations::Reply {
+        debug!(
+            "Received non-ARP reply packet with operation: {:?}",
+            arp_packet.get_operation()
+        );
+        return None;
+    }
+
+    // 检查 ARP 包的目标 IP 地址是否匹配
+    if arp_packet.get_sender_proto_addr() != target_ip {
+        debug!(
+            "Received ARP reply for different target IP: {:?}",
+            arp_packet.get_sender_proto_addr()
+        );
+        return None;
+    }
+
+    // 返回发送者的 MAC 地址
+    Some(arp_packet.get_sender_hw_addr())
+}
