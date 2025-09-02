@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+use crate::iputils_common::reverse_dns_lookup;
 use std::vec;
 pub use std::{
     cell::RefCell,
@@ -319,4 +320,31 @@ pub struct PingConfig {
     // 缓存上一条 RR 原始字节序列，用于判断 "(same route)"
     #[arg(skip)]
     pub last_rr_raw: RefCell<Vec<u8>>, // empty 表示未缓存
+}
+
+impl PingConfig {
+    /// 获取IP对应的主机名，使用缓存避免重复DNS查询
+    pub fn get_hostname_cached(&self, ip: &str) -> String {
+        // 如果使用-n选项，直接返回IP
+        if self.numeric_only {
+            return ip.to_string();
+        }
+
+        // 检查缓存
+        if let Some(cached_hostname) = self.dns_cache.borrow().get(ip) {
+            return cached_hostname.clone();
+        }
+
+        // 缓存中没有，进行DNS查询
+        let hostname = reverse_dns_lookup(ip).unwrap_or_else(|_| ip.to_string());
+
+        // 将结果缓存（限制缓存大小避免内存泄漏）
+        if self.dns_cache.borrow().len() < 1000 {
+            self.dns_cache
+                .borrow_mut()
+                .insert(ip.to_string(), hostname.clone());
+        }
+
+        hostname
+    }
 }

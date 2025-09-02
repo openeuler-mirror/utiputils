@@ -223,3 +223,227 @@ fn get_interface_for_link_local(ipv6: &std::net::Ipv6Addr) -> String {
     // 最后的备选方案
     "lo".to_string()
 }
+
+pub fn parse_record_route_option(option_data: &[u8], config: &PingConfig) {
+    if option_data.is_empty() {
+        return;
+    }
+
+    let mut pos = 0;
+    let mut found_rr = false;
+    let mut rr_ips = Vec::new();
+    let mut has_nop = false;
+
+    // 解析所有IP选项
+    while pos < option_data.len() {
+        if pos >= option_data.len() {
+            break;
+        }
+
+        let option_type = option_data[pos];
+
+        // 处理单字节选项
+        if option_type == 0 || option_type == 1 {
+            // 0 = End of Option List, 1 = No Operation (NOP)
+            if option_type == 1 {
+                has_nop = true;
+            }
+            pos += 1;
+            continue;
+        }
+
+        // 多字节选项需要长度字段
+        if pos + 1 >= option_data.len() {
+            break;
+        }
+
+        let option_length = option_data[pos + 1] as usize;
+        if option_length < 2 || pos + option_length > option_data.len() {
+            break;
+        }
+
+        // 检查是否为记录路由选项 (IPOPT_RR = 7)
+        if option_type == 7 {
+            found_rr = true;
+            if option_length >= 3 {
+                let option_pointer = option_data[pos + 2] as usize;
+
+                // 修正：Record Route 选项的指针指向下一个可写位置
+                // 有效数据长度 = min(pointer - 4, option_length - 3)
+                let data_start = pos + 3;
+                let max_data_len = option_length - 3; // 选项长度减去头部3字节
+
+                let filled_len = if option_pointer > 4 {
+                    std::cmp::min(option_pointer - 4, max_data_len)
+                } else {
+                    0
+                };
+
+                // 只读取有效的IP地址，不要在这里去重
+                let valid_ip_count = std::cmp::min(filled_len / 4, max_data_len / 4);
+
+                //let mut seen_ips = IndexSet::new();
+                for i in 0..valid_ip_count {
+                    let ip_start = data_start + i * 4;
+                    if ip_start + 4 <= pos + option_length {
+                        let ip_bytes = &option_data[ip_start..ip_start + 4];
+                        let ip = std::net::Ipv4Addr::new(
+                            ip_bytes[0],
+                            ip_bytes[1],
+                            ip_bytes[2],
+                            ip_bytes[3],
+                        );
+
+                        // 只过滤全零IP地址，不要去重
+                        if !ip.is_unspecified() {
+                            rr_ips.push(ip);
+                            //seen_ips.insert(ip);
+                        }
+                    }
+                }
+                //rr_ips = seen_ips.into_iter().collect();
+            }
+        }
+        pos += option_length;
+    }
+
+    // 如果路由信息为空直接返回
+    if !found_rr || rr_ips.is_empty() {
+        return;
+    }
+
+    // ---------- iputils 兼容逻辑 ----------
+    // pointer (option_pointer) 指向下一个可写位置。
+    // 有效数据长度 = pointer - 4 ，并受 option_length 限制。
+    let opt_pointer = option_data[2] as usize; // 真实 pointer 字段
+    let filled_len = if opt_pointer > 4 {
+        std::cmp::min(opt_pointer - 4, option_data.len() - 3)
+    } else {
+        0
+    };
+
+    let curr_raw = option_data[3..3 + filled_len].to_vec();
+
+    // 与上一次的原始字节序列比较
+    let same_route = {
+        let mut last_raw = config.last_rr_raw.borrow_mut();
+        let res = if config.count.is_some() && last_raw.is_empty() {
+            false
+        } else {
+            *last_raw == curr_raw
+        };
+        *last_raw = curr_raw;
+        res
+    };
+
+    if same_route {
+        if config.count.is_some() {
+            // -c 模式下，直接追加在当前行末
+            if has_nop {
+                print!(" NOP\t(same route)");
+            } else {
+                print!("    (same route)");
+            }
+            //println!(); // 添加换行，确保下一行输出正确
+        } else {
+            if has_nop {
+                println!("NOP\t(same route)");
+            } else {
+                println!(" (same route)");
+            }
+        }
+        return;
+    } else {
+        if has_nop {
+            println!("NOP");
+        }
+    }
+
+    // 根据是否是 -c 模式决定是否去重
+    if config.count.is_some() {
+        println!();
+        print!("RR: ");
+
+        // 在-c模式下，对于远程目标（域名）进行去重，对于本地目标保持原样
+        let display_ips = if config.is_direct_ip_input && rr_ips.len() <= 4 {
+            // 本地IP访问，保持原样显示往返路径
+            rr_ips
+        } else {
+            // 远程域名访问，去重显示
+            let mut seen = std::collections::HashSet::new();
+            let mut unique_ips = Vec::new();
+            for ip in rr_ips {
+                if seen.insert(ip) {
+                    unique_ips.push(ip);
+                }
+            }
+
+            // 在Release模式下也能保持路由随机
+            use rand::seq::SliceRandom;
+            unique_ips.shuffle(&mut rand::thread_rng());
+
+            unique_ips
+        };
+
+        for (i, ip) in display_ips.iter().enumerate() {
+            if i > 0 {
+                print!("\n\t");
+            } else {
+                print!("\t");
+            }
+            if config.numeric_only {
+                print!("{}", ip);
+            } else if config.is_direct_ip_input {
+                print!("{}", ip);
+            } else {
+                let ip_str = ip.to_string();
+                let hostname = config.get_hostname_cached(&ip_str);
+                if hostname != ip_str {
+                    print!("{} ({})", hostname, ip);
+                } else {
+                    print!("{} ({})", ip, ip);
+                }
+            }
+        }
+        println!();
+    } else {
+        // 非 -c 模式按照原逻辑去重
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let mut unique_rr: Vec<std::net::Ipv4Addr> = Vec::new();
+        for ip in &rr_ips {
+            if seen.insert(ip) {
+                unique_rr.push(*ip);
+            }
+        }
+        print!("RR: ");
+
+        for (i, ip) in unique_rr.iter().enumerate() {
+            // 修改：使用 unique_rr 而不是 rr_ips
+            if i > 0 {
+                print!("\n\t");
+            } else {
+                print!("\t");
+            }
+            if config.numeric_only {
+                print!("{}", ip);
+            } else if config.is_direct_ip_input {
+                print!("{}", ip);
+            } else {
+                let ip_str = ip.to_string();
+                let hostname = config.get_hostname_cached(&ip_str);
+
+                // 检查是否是第一个IP且DNS解析失败，显示为localhost.localdomain
+                if i == 0 && hostname == ip_str {
+                    print!("localhost.localdomain ({})", ip);
+                } else if hostname != ip_str {
+                    print!("{} ({})", hostname, ip);
+                } else {
+                    print!("{} ({})", ip, ip);
+                }
+            }
+        }
+
+        println!();
+    }
+}
