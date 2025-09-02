@@ -12,7 +12,49 @@ use super::config::{parse_command, IfenslaveConfig, HELP_MSG, USAGE_MSG};
 use super::network::NetworkInterface;
 use crate::common::logging::init_logger;
 
-fn main(opt_args: &IfenslaveConfig) -> Result<(), io::Error> {
+pub fn main() {
+    // Initialize logger
+    init_logger();
+
+    let opt_args = parse_command();
+
+    // Handle version information
+    if opt_args.verbose || opt_args.version {
+        println!("utifenslave:v1.1.0 (Mar 17, 2025)");
+        println!("o Donald Becker (becker@cesdis.gsfc.nasa.gov).");
+        println!("o Detach support added on 2000/10/02 by Willy Tarreau (willy at meta-x.org).");
+        println!(
+            "o 2.4 kernel support added on 2001/02/16 by Chad N. Tindel (ctindel at ieee dot org)."
+        );
+        println!("o Rust implementation by longqiang@uniontech.com (2025-06-12)");
+
+        if opt_args.version {
+            std::process::exit(0);
+        }
+    }
+
+    // Handle usage information
+    if opt_args.usage {
+        println!("{}", USAGE_MSG);
+        std::process::exit(0);
+    }
+
+    // Handle detailed help information
+    if opt_args.help {
+        println!("{}", USAGE_MSG);
+        println!("{}", HELP_MSG);
+        std::process::exit(0);
+    }
+
+    let result = main_run(&opt_args);
+    if let Err(e) = result {
+        error!("{}", e);
+        println!("{}", e);
+        std::process::exit(1);
+    }
+}
+
+fn main_run(opt_args: &IfenslaveConfig) -> Result<(), io::Error> {
     // Runtime
     info!("create new runtime");
     let rt = Runtime::new().expect("Failed to create Tokio runtime");
