@@ -347,6 +347,151 @@ impl PingConfig {
 
         hostname
     }
+
+    /// 创建一个用于测试的默认配置
+    pub fn new_for_test() -> Self {
+        Self {
+            host: Some("localhost".to_string()),
+            force_ipv4: false,
+            force_ipv6: false,
+            count: None,
+            identifier_arg: None,
+            flood: false,
+            interval_secs: 1.0,
+            preload_arg: None,
+            mark: None,
+            pattern_arg: None,
+            tclass: None,
+            timeout_secs: 1.0,
+            deadline_secs: None,
+            ttl: 64,
+            packet_size: 56,
+            send_buffer_size_arg: None,
+            audible: false,
+            adaptive: false,
+            strictsource_arg: None,
+            pmtudisc_arg: None,
+            connect_sk: false,
+            debug: false,
+            outstanding: false,
+            verbose: false,
+            quiet: false,
+            print_timestamp: false,
+            loop_multicast_back: false,
+            user_timeout: false,
+            numeric_only: false,
+            broadcast: false,
+            record_route: false,
+            timestamp_arg: None,
+            flowlabel: None,
+            nodeinfo_opt_arg: None,
+            interface_arg: None,
+            domain: "localhost".to_string(),
+            interface: String::new(),
+            interval: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            deadline: Duration::from_secs(0),
+            identifier: 0,
+            preload: 0,
+            send_buffer_size: 0,
+            pattern: Vec::new(),
+            strictsource: String::new(),
+            pmtudisc: String::new(),
+            timestamp: String::new(),
+            nodeinfo_opt: String::new(),
+            starttime: None,
+            local_ip: String::new(),
+            interface_name: String::new(),
+            dns_cache: RefCell::new(HashMap::new()),
+            is_direct_ip_input: false,
+            last_rr_raw: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// 初始化运行时字段
+    fn init_runtime_fields(&mut self) {
+        // 当设置了 IPv4 特有的选项时，自动启用 force_ipv4
+        if self.broadcast || self.record_route || self.timestamp_arg.is_some() {
+            self.force_ipv4 = true;
+        }
+
+        // 当设置了 IPv6 特有的选项时，自动启用 force_ipv6
+        if self.flowlabel.is_some() || self.nodeinfo_opt_arg.is_some() {
+            self.force_ipv6 = true;
+        }
+
+        // 设置域名（初始等于host）
+        self.domain = self.host.as_ref().unwrap_or(&String::new()).clone();
+
+        // 设置接口
+        self.interface = self
+            .interface_arg
+            .as_ref()
+            .unwrap_or(&String::new())
+            .clone();
+
+        // 设置时间间隔
+        self.interval = Duration::from_secs_f64(self.interval_secs);
+        self.timeout = Duration::from_secs_f64(self.timeout_secs);
+        self.deadline = Duration::from_secs_f64(self.deadline_secs.unwrap_or(0.0));
+
+        // 设置标识符
+        self.identifier = self.identifier_arg.unwrap_or_else(rand::random::<u16>);
+
+        // 设置预加载
+        self.preload = self.preload_arg.map(|p| p.min(10)).unwrap_or(0);
+
+        // 设置缓冲区大小
+        self.send_buffer_size = self.send_buffer_size_arg.unwrap_or(0);
+
+        // 设置模式
+        self.pattern = if let Some(pattern_str) = &self.pattern_arg {
+            parse_hex(pattern_str).unwrap_or_else(|e| {
+                eprintln!("ping: invalid pattern: {}", e);
+                std::process::exit(2);
+            })
+        } else {
+            Vec::new()
+        };
+
+        // 设置字符串选项
+        self.strictsource = self
+            .strictsource_arg
+            .as_ref()
+            .unwrap_or(&String::new())
+            .clone();
+        self.pmtudisc = self
+            .pmtudisc_arg
+            .as_ref()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_default();
+        self.timestamp = self
+            .timestamp_arg
+            .as_ref()
+            .map(|t| t.as_str().to_string())
+            .unwrap_or_default();
+        self.nodeinfo_opt = self
+            .nodeinfo_opt_arg
+            .as_ref()
+            .unwrap_or(&String::new())
+            .clone();
+
+        // 初始化运行时字段
+        self.starttime = None;
+        self.local_ip = String::new();
+        self.interface_name = String::new();
+        self.dns_cache = RefCell::new(HashMap::new());
+        self.is_direct_ip_input = self
+            .host
+            .as_ref()
+            .map(|h| {
+                h.chars()
+                    .all(|c| c.is_ascii_digit() || c == '.' || c == ':')
+            })
+            .unwrap_or(false);
+        // 清空上一次 RR 记录
+        self.last_rr_raw.borrow_mut().clear();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -451,5 +596,110 @@ impl PingStats {
 
     pub fn print_summary(&self, domain: &str) {
         println!("{}", self.summary(domain));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_auto_force_ipv4_with_broadcast() {
+        let mut config = PingConfig::new_for_test();
+        config.broadcast = true;
+        config.init_runtime_fields();
+        assert!(
+            config.force_ipv4,
+            "broadcast option should automatically enable force_ipv4"
+        );
+    }
+
+    #[test]
+    fn test_auto_force_ipv4_with_record_route() {
+        let mut config = PingConfig::new_for_test();
+        config.record_route = true;
+        config.init_runtime_fields();
+        assert!(
+            config.force_ipv4,
+            "record_route option should automatically enable force_ipv4"
+        );
+    }
+
+    #[test]
+    fn test_auto_force_ipv4_with_timestamp() {
+        let mut config = PingConfig::new_for_test();
+        config.timestamp_arg = Some(TimestampType::Tsonly);
+        config.init_runtime_fields();
+        assert!(
+            config.force_ipv4,
+            "timestamp option should automatically enable force_ipv4"
+        );
+    }
+
+    #[test]
+    fn test_no_auto_force_ipv4_without_options() {
+        let mut config = PingConfig::new_for_test();
+        config.init_runtime_fields();
+        assert!(
+            !config.force_ipv4,
+            "force_ipv4 should not be enabled without IPv4-specific options"
+        );
+    }
+
+    #[test]
+    fn test_auto_force_ipv4_with_multiple_options() {
+        let mut config = PingConfig::new_for_test();
+        config.broadcast = true;
+        config.record_route = true;
+        config.timestamp_arg = Some(TimestampType::Tsandaddr);
+        config.init_runtime_fields();
+        assert!(
+            config.force_ipv4,
+            "multiple IPv4 options should automatically enable force_ipv4"
+        );
+    }
+
+    #[test]
+    fn test_auto_force_ipv6_with_flowlabel() {
+        let mut config = PingConfig::new_for_test();
+        config.flowlabel = Some(12345);
+        config.init_runtime_fields();
+        assert!(
+            config.force_ipv6,
+            "flowlabel option should automatically enable force_ipv6"
+        );
+    }
+
+    #[test]
+    fn test_auto_force_ipv6_with_nodeinfo() {
+        let mut config = PingConfig::new_for_test();
+        config.nodeinfo_opt_arg = Some("name".to_string());
+        config.init_runtime_fields();
+        assert!(
+            config.force_ipv6,
+            "nodeinfo option should automatically enable force_ipv6"
+        );
+    }
+
+    #[test]
+    fn test_no_auto_force_ipv6_without_options() {
+        let mut config = PingConfig::new_for_test();
+        config.init_runtime_fields();
+        assert!(
+            !config.force_ipv6,
+            "force_ipv6 should not be enabled without IPv6-specific options"
+        );
+    }
+
+    #[test]
+    fn test_auto_force_ipv6_with_multiple_options() {
+        let mut config = PingConfig::new_for_test();
+        config.flowlabel = Some(54321);
+        config.nodeinfo_opt_arg = Some("ipv6".to_string());
+        config.init_runtime_fields();
+        assert!(
+            config.force_ipv6,
+            "multiple IPv6 options should automatically enable force_ipv6"
+        );
     }
 }
