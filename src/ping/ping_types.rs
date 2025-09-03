@@ -348,3 +348,108 @@ impl PingConfig {
         hostname
     }
 }
+
+#[derive(Debug, Default)]
+pub struct PingStats {
+    pub transmitted: u32,
+    pub received: u32,
+    pub errors: u32, // 错误计数，如destination unreachable等
+    pub total_rtt: f64,
+    pub total_rtt_squared: f64, // 用于计算标准差
+    pub min_rtt: f64,
+    pub max_rtt: f64,
+    pub start_time: Option<Instant>,
+    pub sent_times: HashMap<u16, Instant>,
+}
+
+impl PingStats {
+    pub fn new() -> Self {
+        Self {
+            min_rtt: f64::MAX,
+            max_rtt: f64::MIN,
+            ..Default::default()
+        }
+    }
+    pub fn record_sent_time(&mut self, seq: u16) {
+        self.sent_times.insert(seq, Instant::now());
+        self.transmitted += 1;
+    }
+    pub fn get_sent_time(&mut self, seq: u16) -> Option<Instant> {
+        self.sent_times.remove(&seq)
+    }
+
+    pub fn update(&mut self, rtt: f64) {
+        self.received += 1;
+        self.total_rtt += rtt;
+        self.total_rtt_squared += rtt * rtt;
+        self.min_rtt = self.min_rtt.min(rtt);
+        self.max_rtt = self.max_rtt.max(rtt);
+    }
+
+    pub fn record_error(&mut self) {
+        self.errors += 1;
+    }
+
+    fn summary(&self, domain: &str) -> String {
+        let loss_percent = if self.transmitted > 0 {
+            let lost = self.transmitted - self.received;
+            (lost as f64 / self.transmitted as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let avg_rtt = if self.received > 0 {
+            self.total_rtt / self.received as f64
+        } else {
+            0.0
+        };
+
+        let duration = self.start_time.map(|st| st.elapsed()).unwrap_or_default();
+
+        let mut result = if self.errors > 0 {
+            format!(
+                "\n--- {} ping statistics ---\n{} packets transmitted, {} received, +{} errors, {:.1}% packet loss, time {}ms",
+                domain,
+                self.transmitted,
+                self.received,
+                self.errors,
+                loss_percent,
+                duration.as_millis()
+            )
+        } else {
+            format!(
+                "\n--- {} ping statistics ---\n{} packets transmitted, {} received, {:.1}% packet loss, time {}ms",
+                domain,
+                self.transmitted,
+                self.received,
+                loss_percent,
+                duration.as_millis()
+            )
+        };
+
+        // 添加RTT统计信息（仅在有收到回复时显示）
+        if self.received > 0 {
+            // 计算标准差 (样本标准差)
+            let variance = if self.received > 1 {
+                let mean_of_squares = self.total_rtt_squared / self.received as f64;
+                let square_of_mean = avg_rtt * avg_rtt;
+                (mean_of_squares - square_of_mean).max(0.0)
+            } else {
+                0.0
+            };
+            let mdev = variance.sqrt();
+
+            result.push_str(&format!(
+                "\nrtt min/avg/max/mdev = {:.3}/{:.3}/{:.3}/{:.3} ms",
+                self.min_rtt, avg_rtt, self.max_rtt, mdev
+            ));
+        }
+
+        result.push('\n');
+        result
+    }
+
+    pub fn print_summary(&self, domain: &str) {
+        println!("{}", self.summary(domain));
+    }
+}
