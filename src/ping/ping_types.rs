@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-use crate::iputils_common::reverse_dns_lookup;
 use std::vec;
 pub use std::{
     cell::RefCell,
@@ -26,6 +25,8 @@ pub use std::{
 
 use clap::{Parser, ValueEnum};
 use nix::sys::socket::SockType;
+
+use crate::iputils_common::reverse_dns_lookup;
 
 const DEFDATALEN: usize = 64 - 8;
 const MAXWAIT: u64 = 10;
@@ -323,29 +324,31 @@ pub struct PingConfig {
 }
 
 impl PingConfig {
-    /// 获取IP对应的主机名，使用缓存避免重复DNS查询
-    pub fn get_hostname_cached(&self, ip: &str) -> String {
-        // 如果使用-n选项，直接返回IP
-        if self.numeric_only {
-            return ip.to_string();
+    /// 解析命令行参数并初始化运行时字段
+    pub fn from_args() -> Self {
+        let mut config = Self::parse();
+
+        // 特殊处理：如果 -N help，显示帮助并退出
+        if let Some(ref nodeinfo) = config.nodeinfo_opt_arg {
+            if nodeinfo == "help" {
+                Self::print_nodeinfo_help();
+                std::process::exit(0);
+            }
         }
 
-        // 检查缓存
-        if let Some(cached_hostname) = self.dns_cache.borrow().get(ip) {
-            return cached_hostname.clone();
+        // 验证必需的参数
+        if config.host.is_none() {
+            eprintln!("error: the following required arguments were not provided:");
+            eprintln!("  <DESTINATION>");
+            eprintln!();
+            eprintln!("Usage: utping [OPTIONS] <DESTINATION>");
+            eprintln!();
+            eprintln!("For more information, try '--help'.");
+            std::process::exit(2);
         }
 
-        // 缓存中没有，进行DNS查询
-        let hostname = reverse_dns_lookup(ip).unwrap_or_else(|_| ip.to_string());
-
-        // 将结果缓存（限制缓存大小避免内存泄漏）
-        if self.dns_cache.borrow().len() < 1000 {
-            self.dns_cache
-                .borrow_mut()
-                .insert(ip.to_string(), hostname.clone());
-        }
-
-        hostname
+        config.init_runtime_fields();
+        config
     }
 
     /// 创建一个用于测试的默认配置
@@ -492,6 +495,70 @@ impl PingConfig {
         // 清空上一次 RR 记录
         self.last_rr_raw.borrow_mut().clear();
     }
+
+    pub fn initStartTime(&mut self) {
+        self.starttime = Some(Instant::now());
+    }
+
+    pub fn getStartTime(&self) -> Instant {
+        self.starttime.unwrap()
+    }
+
+    pub fn setInterfaceInfo(&mut self, ip: String, interface_name: String) {
+        self.local_ip = ip;
+        self.interface_name = interface_name;
+    }
+
+    pub fn getInterfaceInfo(&self) -> (String, String) {
+        (self.local_ip.clone(), self.interface_name.clone())
+    }
+
+    /// 获取IP对应的主机名，使用缓存避免重复DNS查询
+    pub fn get_hostname_cached(&self, ip: &str) -> String {
+        // 如果使用-n选项，直接返回IP
+        if self.numeric_only {
+            return ip.to_string();
+        }
+
+        // 检查缓存
+        if let Some(cached_hostname) = self.dns_cache.borrow().get(ip) {
+            return cached_hostname.clone();
+        }
+
+        // 缓存中没有，进行DNS查询
+        let hostname = reverse_dns_lookup(ip).unwrap_or_else(|_| ip.to_string());
+
+        // 将结果缓存（限制缓存大小避免内存泄漏）
+        if self.dns_cache.borrow().len() < 1000 {
+            self.dns_cache
+                .borrow_mut()
+                .insert(ip.to_string(), hostname.clone());
+        }
+
+        hostname
+    }
+
+    /// 显示 nodeinfo 帮助信息
+    fn print_nodeinfo_help() {
+        println!("ping -6 -N <nodeinfo opt>");
+        println!("Help:");
+        println!("  help");
+        println!("Query:");
+        println!("  name");
+        println!("  ipv6");
+        println!("  ipv6-all");
+        println!("  ipv6-compatible");
+        println!("  ipv6-global");
+        println!("  ipv6-linklocal");
+        println!("  ipv6-sitelocal");
+        println!("  ipv4");
+        println!("  ipv4-all");
+        println!("Subject:");
+        println!("  subject-ipv6=addr");
+        println!("  subject-ipv4=addr");
+        println!("  subject-name=name");
+        println!("  subject-fqdn=name");
+    }
 }
 
 #[derive(Debug, Default)]
@@ -597,6 +664,11 @@ impl PingStats {
     pub fn print_summary(&self, domain: &str) {
         println!("{}", self.summary(domain));
     }
+}
+
+pub struct SocketSt {
+    pub fd: std::os::unix::io::RawFd,
+    pub socktype: SockType,
 }
 
 #[cfg(test)]
