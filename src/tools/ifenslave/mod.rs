@@ -8,3 +8,5 @@ pub mod bonding;
 pub mod config;
 pub mod main;
 pub mod network;
+
+pub use main::main;
