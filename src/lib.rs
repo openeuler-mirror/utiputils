@@ -13,3 +13,4 @@ pub mod arping;
 pub mod iputils_common;
 pub mod ping;
 pub mod tools;
+pub mod tracepath;
