@@ -25,7 +25,9 @@ use pnet::packet::{
 use socket2::Socket;
 
 use crate::{
-    common::signal::RUNNING, iputils_common::reverse_dns_lookup, ping::ping_types::PingConfig,
+    common::signal::RUNNING,
+    iputils_common::reverse_dns_lookup,
+    ping::ping_types::{PingConfig, PingStats},
 };
 
 pub const PACKET_SIZE: usize = 64;
@@ -169,6 +171,31 @@ impl IcmpEchoRequest {
 
         buffer
     }
+
+    pub fn build_packet_V6(&self, pgConfig: &PingConfig) -> Vec<u8> {
+        let mut buffer = vec![0u8; 8 + self.payload.len()];
+        let mut packet =
+            pnet::packet::icmpv6::echo_request::MutableEchoRequestPacket::new(&mut buffer).unwrap();
+
+        packet.set_icmpv6_type(Icmpv6Types::EchoRequest);
+        packet.set_identifier(self.identifier);
+        packet.set_sequence_number(self.sequence);
+        packet.set_payload(&self.payload);
+
+        // 设置填充数据
+        if !pgConfig.pattern.is_empty() {
+            debug!("fill pattern: {:?}", pgConfig.pattern);
+            let data = packet.payload_mut();
+            for (i, item) in data.iter_mut().enumerate() {
+                *item = pgConfig.pattern[i % pgConfig.pattern.len()]; // 循环填充
+            }
+        }
+
+        let checksum = pnet::packet::util::checksum(packet.packet(), 1);
+        packet.set_checksum(checksum);
+
+        buffer
+    }
 }
 
 // 获取类似原生ping的时间戳（struct timeval格式）
@@ -222,6 +249,26 @@ fn get_interface_for_link_local(ipv6: &std::net::Ipv6Addr) -> String {
 
     // 最后的备选方案
     "lo".to_string()
+}
+
+pub fn timeout_or_count_exit(pgConfig: &PingConfig, status: &PingStats) -> bool {
+    if let Some(count) = pgConfig.count {
+        if status.transmitted >= count {
+            info!("Ping count reached, stopping...");
+            RUNNING.store(false, Ordering::SeqCst);
+            return true;
+        }
+    }
+
+    if pgConfig.deadline > Duration::from_secs(0)
+        && pgConfig.getStartTime().elapsed() >= pgConfig.deadline
+    {
+        info!("Deadline reached, stopping...");
+        RUNNING.store(false, Ordering::SeqCst);
+        return true;
+    }
+
+    false
 }
 
 pub fn parse_record_route_option(option_data: &[u8], config: &PingConfig) {
