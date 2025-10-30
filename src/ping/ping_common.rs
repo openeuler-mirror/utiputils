@@ -450,6 +450,123 @@ pub fn print_response(ip: &IpAddr, seq: u16, rtt: f64, ttl: u8, config: &PingCon
     }
 }
 
+/// 使用DNS缓存的优化版本print_response
+pub fn print_response_cached(ip: &IpAddr, seq: u16, rtt: f64, ttl: u8, config: &PingConfig) {
+    print_response_cached_with_ident(ip, seq, rtt, ttl, config, config.identifier);
+}
+
+/// 带有 identifier 参数的 print_response 版本，支持 verbose 模式
+pub fn print_response_cached_with_ident(
+    ip: &IpAddr,
+    seq: u16,
+    rtt: f64,
+    ttl: u8,
+    config: &PingConfig,
+    ident: u16,
+) {
+    if config.quiet {
+        return;
+    }
+
+    // 使用缓存的DNS查询
+    let ip_str = ip.to_string();
+    let hostname = config.get_hostname_cached(&ip_str);
+
+    // 检查原始输入是否为IP地址
+    let is_direct_ip_input = config
+        .host
+        .as_ref()
+        .map(|h| h.parse::<IpAddr>().is_ok())
+        .unwrap_or(false);
+
+    let from_info = if config.numeric_only {
+        // 对于IPv6链路本地地址，即使在数字模式下也要显示接口
+        if let IpAddr::V6(ipv6) = ip {
+            if is_ipv6_link_local(ipv6) {
+                format!("{}%{}", hostname, get_interface_for_link_local(ipv6))
+            } else {
+                hostname
+            }
+        } else {
+            hostname
+        }
+    } else {
+        // 对于直接IP输入，即使有反向DNS解析结果也不显示（匹配原生ping行为）
+        if is_direct_ip_input {
+            // 直接IP输入情况：只显示IP，不显示反向DNS解析结果
+            // 对于IPv6链路本地地址，在IP地址后显示接口
+            if let IpAddr::V6(ipv6) = ip {
+                if is_ipv6_link_local(ipv6) {
+                    format!("{}%{}", ip, get_interface_for_link_local(ipv6))
+                } else {
+                    ip.to_string()
+                }
+            } else {
+                ip.to_string()
+            }
+        } else {
+            // 域名解析情况：显示 hostname (ip) 格式
+            // 对于IPv6链路本地地址，在IP地址后显示接口
+            if let IpAddr::V6(ipv6) = ip {
+                if is_ipv6_link_local(ipv6) {
+                    format!(
+                        "{} ({}%{})",
+                        hostname,
+                        ip,
+                        get_interface_for_link_local(ipv6)
+                    )
+                } else {
+                    format!("{} ({})", hostname, ip)
+                }
+            } else {
+                format!("{} ({})", hostname, ip)
+            }
+        }
+    };
+
+    // 对于时间戳模式，始终显示标准ICMP包大小（数据+ICMP头）
+    // 这与原生ping的行为一致
+    let packet_size = config.packet_size + 8; // 数据 + ICMP头
+
+    let message = if config.verbose {
+        // Verbose 模式显示更多信息，包括 ident
+        format!(
+            "{} bytes from {}: icmp_seq={} ident={} ttl={} time={:.3} ms",
+            packet_size, from_info, seq, ident, ttl, rtt
+        )
+    } else {
+        format!(
+            "{} bytes from {}: icmp_seq={} ttl={} time={:.3} ms",
+            packet_size, from_info, seq, ttl, rtt
+        )
+    };
+
+    // 修改最后的输出部分
+    if config.print_timestamp {
+        if let Some(timestamp) = chrono::Local::now().timestamp_nanos_opt() {
+            if config.count.is_some() {
+                // -c 模式下，不换行
+                //print!("[{:?}] {}", timestamp as f64 / 1_000_000_000.0, message);
+                println!("[{:?}] {}", timestamp as f64 / 1_000_000_000.0, message);
+                use std::io::{stdout, Write};
+                stdout().flush().unwrap();
+            } else {
+                println!("[{:?}] {}", timestamp as f64 / 1_000_000_000.0, message);
+            }
+        }
+    } else {
+        if config.count.is_some() {
+            // -c 模式下，不换行
+            print!("{}", message);
+            //println!("{}", message);
+            use std::io::{stdout, Write};
+            stdout().flush().unwrap();
+        } else {
+            println!("{}", message);
+        }
+    }
+}
+
 /// 判断IPv6地址是否为链路本地地址
 fn is_ipv6_link_local(ipv6: &std::net::Ipv6Addr) -> bool {
     // IPv6链路本地地址前缀为 fe80::/10
