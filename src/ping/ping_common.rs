@@ -207,6 +207,249 @@ fn get_timestamp_ms() -> u32 {
     now.as_secs() as u32
 }
 
+pub fn set_socket_option(
+    socket: &Socket,
+    level: libc::c_int,
+    optname: libc::c_int,
+    optval: libc::c_int,
+) -> Result<(), std::io::Error> {
+    unsafe {
+        let ret = libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            optname,
+            &optval as *const _ as *const libc::c_void,
+            mem::size_of_val(&optval) as libc::socklen_t,
+        );
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+pub fn set_socket_opt(
+    socket: &Socket,
+    level: libc::c_int,
+    optname: libc::c_int,
+    optval: &[u8],
+) -> io::Result<()> {
+    unsafe {
+        let ret = libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            optname,
+            optval.as_ptr() as *const libc::c_void,
+            optval.len() as libc::socklen_t,
+        );
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+// 设置记录路由选项
+pub fn set_record_route_option(socket: &Socket, use_ipv6: bool) -> io::Result<()> {
+    if use_ipv6 {
+        // IPv6 记录路由已废弃，直接返回错误或忽略
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "IPv6 record route is deprecated",
+        ))
+    } else {
+        // 与 iputils 保持一致：首字节使用 NOP(1) 对齐，RR 选项从字节 1 开始
+        let mut rr = vec![0u8; 40];
+        rr[0] = 1; // IPOPT_NOP
+        rr[1] = 7; // IPOPT_RR
+        rr[2] = 39; // length（含 RR 本身 + pointer + 数据区，保持与 iputils 相同）
+        rr[3] = 4; // pointer，初始为4
+        set_socket_opt(socket, libc::IPPROTO_IP, libc::IP_OPTIONS, &rr)
+    }
+}
+
+// 设置时间戳选项
+pub fn set_timestamp_option(socket: &Socket, ts_type: &str) -> io::Result<()> {
+    let mut ts = vec![0u8; 40];
+    ts[0] = 68; // IPOPT_TS
+    ts[1] = 40; // length
+    ts[2] = 5; // pointer
+    ts[3] = match ts_type {
+        "tsonly" => 0,
+        "tsandaddr" => 1,
+        "tsprespec" => 3,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid timestamp type",
+            ))
+        }
+    };
+
+    set_socket_opt(socket, libc::IPPROTO_IP, libc::IP_OPTIONS, &ts)?;
+    Ok(())
+}
+
+fn get_ip_from_interface(interface_name: &str) -> Result<IpAddr, anyhow::Error> {
+    let interfaces = pnet::datalink::interfaces();
+    for interface in interfaces {
+        if interface.name == interface_name {
+            for ip in interface.ips {
+                if let Ok(ip) = ip.ip().to_owned().to_string().parse::<IpAddr>() {
+                    return Ok(ip);
+                }
+            }
+        }
+    }
+    Err(anyhow::anyhow!("Failed to get IP from interface"))
+}
+pub fn bind_to_interface_or_ip(
+    socket: &socket2::Socket,
+    interface_or_ip: &str,
+) -> Result<(IpAddr, String), anyhow::Error> {
+    // 尝试将输入解析为IP地址
+    if let Ok(ip_addr) = interface_or_ip.parse::<Ipv4Addr>() {
+        let source_addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip_addr, 0));
+        socket.bind(&source_addr.into())?;
+        Ok((IpAddr::V4(ip_addr), "".to_string()))
+    } else if let Ok(ip_addr) = interface_or_ip.parse::<Ipv6Addr>() {
+        let source_addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip_addr, 0, 0, 0));
+        socket.bind(&source_addr.into())?;
+        Ok((IpAddr::V6(ip_addr), "".to_string()))
+    } else {
+        // 将输入解析为接口名
+        socket.bind_device(Some(interface_or_ip.as_bytes()))?;
+        let ip_add = get_ip_from_interface(interface_or_ip)?;
+        Ok((ip_add, interface_or_ip.to_string()))
+    }
+}
+
+pub fn print_titile(target: IpAddr, pgConfig: &PingConfig) {
+    // 根据IP版本决定格式
+    match target {
+        IpAddr::V6(_) => {
+            // IPv6格式：PING hostname(hostname (ip)) 56 data bytes
+            // 检查是否为直接IP输入
+            let is_direct_ip_input = pgConfig
+                .host
+                .as_ref()
+                .map(|h| h.parse::<IpAddr>().is_ok())
+                .unwrap_or(false);
+
+            let title_format = if is_direct_ip_input {
+                // 直接IP输入：PING ip(ip) 56 data bytes
+                format!("{}({})", target, target)
+            } else {
+                // 域名输入：PING hostname(hostname (ip)) 56 data bytes
+                format!("{}({} ({}))", pgConfig.domain, pgConfig.domain, target)
+            };
+
+            if !pgConfig.interface.is_empty() || !pgConfig.strictsource.is_empty() {
+                let interfaceInfo = format!(
+                    "from {} {}",
+                    pgConfig.getInterfaceInfo().0,
+                    pgConfig.getInterfaceInfo().1
+                );
+                println!(
+                    "PING {} {} {} data bytes",
+                    title_format, interfaceInfo, pgConfig.packet_size
+                );
+            } else {
+                println!("PING {} {} data bytes", title_format, pgConfig.packet_size);
+            }
+        }
+        IpAddr::V4(_) => {
+            // IPv4格式：PING target (target) 56(84) bytes of data.
+            let data_size = pgConfig.packet_size;
+            let mut total_size = data_size + 8 + IPV4_HEADER_LEN; // 数据 + ICMP + IP头
+
+            // 根据启用的选项计算额外的字节数
+            if !pgConfig.timestamp.is_empty() {
+                total_size += TIMESTAMP_OPTION_LEN; // 时间戳选项 40字节
+            }
+            if pgConfig.record_route {
+                total_size += 40; // Record Route选项 40字节
+            }
+
+            if !pgConfig.interface.is_empty() || !pgConfig.strictsource.is_empty() {
+                let interfaceInfo = format!(
+                    "from {} {}",
+                    pgConfig.getInterfaceInfo().0,
+                    pgConfig.getInterfaceInfo().1
+                );
+                println!(
+                    "PING {} ({}) {} {}({}) bytes of data.",
+                    pgConfig.domain, target, interfaceInfo, data_size, total_size
+                );
+            } else {
+                println!(
+                    "PING {} ({}) {}({}) bytes of data.",
+                    pgConfig.domain, target, data_size, total_size
+                );
+            }
+        }
+    }
+}
+
+pub fn print_response(ip: &IpAddr, seq: u16, rtt: f64, ttl: u8, config: &PingConfig) {
+    if config.quiet {
+        return;
+    }
+
+    // TODO verbos flag
+    // let size_info = if config.verbose {
+    //     format!("{} bytes from ", config.packet_size + 8 + 20)
+    // } else {
+    //     String::new()
+    // };
+
+    // 根据-n选项决定输出格式
+    let from_info = if config.numeric_only {
+        // 使用-n选项：只显示IP地址，不进行反向DNS查找
+        ip.to_string()
+    } else {
+        // 不使用-n选项：进行反向DNS查找并显示主机名(IP)格式
+        let hostname = reverse_dns_lookup(&ip.to_string()).unwrap_or_else(|_| ip.to_string());
+        if hostname != ip.to_string() {
+            format!("{} ({})", hostname, ip)
+        } else {
+            format!("{} ({})", ip, ip)
+        }
+    };
+
+    let message = format!(
+        "{} bytes from {}: icmp_seq={} ttl={} time={:.3} ms",
+        config.packet_size + 8,
+        from_info,
+        seq,
+        ttl,
+        rtt
+    );
+
+    if config.print_timestamp {
+        if let Some(timestamp) = chrono::Local::now().timestamp_nanos_opt() {
+            if config.count.is_some() {
+                // -c 模式下，不换行
+                print!("[{:?}] {}", timestamp as f64 / 1_000_000_000.0, message);
+                //println!("[{:?}] {}", timestamp as f64 / 1_000_000_000.0, message);
+
+                use std::io::{stdout, Write};
+                stdout().flush().unwrap();
+            } else {
+                println!("[{:?}] {}", timestamp as f64 / 1_000_000_000.0, message);
+            }
+        }
+    } else {
+        if config.count.is_some() {
+            print!("{}", message);
+            use std::io::{stdout, Write};
+            stdout().flush().unwrap();
+        } else {
+            println!("{}", message);
+        }
+    }
+}
+
 /// 判断IPv6地址是否为链路本地地址
 fn is_ipv6_link_local(ipv6: &std::net::Ipv6Addr) -> bool {
     // IPv6链路本地地址前缀为 fe80::/10
