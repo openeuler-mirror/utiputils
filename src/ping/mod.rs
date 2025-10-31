@@ -6,4 +6,5 @@
 
 pub mod ping6_common;
 pub mod ping_common;
+pub mod ping_impl;
 pub mod ping_types;
