@@ -315,3 +315,115 @@ fn send_icmpv6_requests(
     }
     Ok(())
 }
+
+fn receive_icmpv6_replies(
+    socket: &Socket,
+    identifier: u16,
+    pgConfig: &PingConfig,
+    status: &mut PingStats,
+) -> Result<(), anyhow::Error> {
+    debug!("Receiving ICMP replies: {:?}", status.sent_times);
+    for _ in 0..pgConfig.preload {
+        if !is_running() {
+            break;
+        }
+        match receive_icmpv6_reply(socket, identifier) {
+            Ok((receive_seq, size, src)) => {
+                if let Some(sent_time) = status.get_sent_time(receive_seq) {
+                    let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0; // 转换为毫秒
+                    print_response_cached_with_ident(
+                        &IpAddr::V6(src),
+                        receive_seq,
+                        rtt,
+                        pgConfig.ttl as u8,
+                        pgConfig,
+                        pgConfig.identifier,
+                    );
+                    status.update(rtt);
+                    if pgConfig.audible {
+                        print!("\x07");
+                        let _ = std::io::stdout().flush();
+                    }
+                    debug!("ICMP reply received: size={}, src={}", size, src);
+                } else {
+                    error!("Failed to find sent time for seq={}", receive_seq);
+                }
+            }
+            Err(e) => {
+                error!("Failed to receive ICMP reply: {}", e);
+            }
+        }
+
+        if let Some(count) = pgConfig.count {
+            if status.transmitted >= count {
+                debug!("Ping count reached, stopping...");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn preload_send_and_receive(
+    socket: &Socket,
+    target: Ipv6Addr,
+    pgConfig: &PingConfig,
+    status: &mut PingStats,
+) -> Result<(), anyhow::Error> {
+    send_icmpv6_requests(socket, target, pgConfig, 1, status)?;
+    receive_icmpv6_replies(socket, pgConfig.identifier, pgConfig, status)?;
+    Ok(())
+}
+
+fn flood_ping_v6(
+    socket: &Socket,
+    target: Ipv6Addr,
+    pgConfig: &PingConfig,
+    status: &mut PingStats,
+) -> Result<(), anyhow::Error> {
+    let mut start_seq = 1;
+    loop {
+        if !is_running() {
+            info!("exit flood mode");
+            break;
+        }
+        let request = IcmpEchoRequest::new(start_seq, pgConfig.identifier, pgConfig.packet_size);
+        let packet = request.build_packet_V6(pgConfig);
+        status.record_sent_time(start_seq);
+
+        if let Err(e) = send_icmpv6_request(socket, target, packet, pgConfig) {
+            error!("Failed to send ICMP request: {}", e);
+        }
+
+        // Print a dot for each sent packet
+        print!(".");
+        let _ = std::io::stdout().flush();
+
+        match receive_icmpv6_reply(socket, pgConfig.identifier) {
+            Ok((receive_seq, _size, _src)) => {
+                if let Some(sent_time) = status.get_sent_time(receive_seq) {
+                    let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0; // 转换为毫秒
+                                                                               // print_response(&IpAddr::V4(src), receive_seq, rtt, pgConfig);
+                    status.update(rtt);
+                    // Print a backspace for each received packet
+                    print!("\x08");
+                    let _ = std::io::stdout().flush();
+                } else {
+                    error!("Failed to find sent time for seq={}", receive_seq);
+                }
+            }
+            Err(e) => {
+                error!("Failed to receive ICMP reply: {}", e);
+            }
+        }
+
+        start_seq = start_seq.wrapping_add(1);
+        std::thread::sleep(Duration::from_millis(25));
+
+        if timeout_or_count_exit(pgConfig, status) {
+            break;
+        }
+    }
+
+    Ok(())
+}
