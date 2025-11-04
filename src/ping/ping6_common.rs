@@ -427,3 +427,387 @@ fn flood_ping_v6(
 
     Ok(())
 }
+
+pub fn ping6_run(target: Ipv6Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
+    info!("create_icmp_socket ...");
+    let socket = create_icmpv6_socket(pgConfig)?;
+    info!("create_icmp_socket success ...");
+
+    if pgConfig.connect_sk {
+        info!("Connecting to target: {}", target);
+        socket
+            .connect(&SockAddr::from(SocketAddrV6::new(target, 0, 0, 0)))
+            .context("Failed to connect to target")?;
+    }
+
+    // 检查是否是 nodeinfo 查询
+    if !pgConfig.nodeinfo_opt.is_empty() {
+        info!("Running IPv6 nodeinfo query: {}", pgConfig.nodeinfo_opt);
+        return run_nodeinfo_query(&socket, target, pgConfig);
+    }
+
+    let identifier = pgConfig.identifier;
+    let mut status = PingStats::new();
+    status.start_time = Some(Instant::now());
+
+    // 如果使用了pattern，先显示pattern信息（匹配原生ping行为）
+    if !pgConfig.pattern.is_empty() {
+        println!("PATTERN: 0x{}", hex::encode(&pgConfig.pattern));
+    }
+
+    print_titile(IpAddr::V6(target), pgConfig);
+
+    if pgConfig.flood {
+        flood_ping_v6(&socket, target, pgConfig, &mut status)?;
+        status.print_summary(&pgConfig.domain);
+        return Ok(());
+    }
+
+    if pgConfig.preload > 0 {
+        info!("Preloading {} ICMP requests", pgConfig.preload);
+        preload_send_and_receive(&socket, target, pgConfig, &mut status)?;
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        if timeout_or_count_exit(pgConfig, &status) {
+            status.print_summary(&pgConfig.domain);
+            return Ok(());
+        }
+    }
+
+    info!("Start pinging target: {}", target.to_string());
+    let mut seq = pgConfig.preload + 1;
+    let mut smoothed_rtt: Option<f64> = None;
+    const ALPHA: f64 = 0.125; // 平滑因子
+
+    while is_running() {
+        let request = IcmpEchoRequest::new(seq, identifier, pgConfig.packet_size);
+        let packet = request.build_packet_V6(pgConfig);
+        debug!("Sending ICMPv6 packet: seq={}", seq);
+
+        // 发送ICMP包
+        status.record_sent_time(seq);
+        if let Err(e) = send_icmpv6_request(&socket, target, packet, pgConfig) {
+            error!("Failed to send ICMP request: {}", e);
+            break;
+        }
+
+        // 阻塞接收响应包（确保RTT测量准确）
+        match receive_icmpv6_reply(&socket, identifier) {
+            Ok((receive_seq, size, src)) => {
+                debug!(
+                    "ICMPv6 reply received: seq={}, size={}, src={}",
+                    receive_seq, size, src
+                );
+
+                if let Some(sent_time) = status.get_sent_time(receive_seq) {
+                    let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0;
+                    print_response_cached_with_ident(
+                        &IpAddr::V6(src),
+                        receive_seq,
+                        rtt,
+                        pgConfig.ttl as u8,
+                        pgConfig,
+                        pgConfig.identifier,
+                    );
+                    status.update(rtt);
+
+                    if pgConfig.audible {
+                        print!("\x07");
+                        let _ = std::io::stdout().flush();
+                    }
+
+                    // 更新平滑RTT
+                    smoothed_rtt = match smoothed_rtt {
+                        Some(avg) => Some(ALPHA * rtt + (1.0 - ALPHA) * avg),
+                        None => Some(rtt),
+                    };
+                } else {
+                    error!("Failed to find sent time for seq={}", receive_seq);
+                }
+            }
+            Err(e) => {
+                // 检查是否是ICMP错误（destination unreachable等）
+                let error_msg = e.to_string();
+                if error_msg.contains("Destination unreachable")
+                    || error_msg.contains("Packet too big")
+                    || error_msg.contains("Time exceeded")
+                {
+                    status.record_error();
+                } else {
+                    if pgConfig.outstanding {
+                        println!("No reply yet for sequence {}", seq);
+                    }
+                    debug!("Failed to receive ICMPv6 reply: {}", e);
+                }
+            }
+        }
+
+        seq = seq.wrapping_add(1);
+
+        // 动态调整间隔
+        if pgConfig.adaptive {
+            let interval = match smoothed_rtt {
+                Some(avg) => Duration::from_millis((avg * 1.5).max(10.0) as u64), // 基础间隔=1.5*RTT，最小10ms
+                None => Duration::from_millis(100),                               // 初始默认间隔
+            };
+            std::thread::sleep(interval);
+        } else {
+            // 使用更短的间隔，提升性能（从默认1秒改为200ms）
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        if timeout_or_count_exit(pgConfig, &status) {
+            break;
+        }
+    }
+
+    status.print_summary(&pgConfig.domain);
+    Ok(())
+}
+
+// IPv6 nodeinfo 查询实现
+fn run_nodeinfo_query(
+    socket: &Socket,
+    target: Ipv6Addr,
+    pgConfig: &PingConfig,
+) -> Result<(), anyhow::Error> {
+    info!("Starting IPv6 nodeinfo query to: {}", target);
+
+    let mut status = PingStats::new();
+    status.start_time = Some(Instant::now());
+
+    println!("PING {}({}) {} data bytes", target, target, 56); // 与原生ping保持一致的显示大小
+
+    let mut seq = 1u16;
+    let target_addr = SocketAddrV6::new(target, 0, 0, 0);
+    let sock_addr = SockAddr::from(target_addr);
+
+    // 主循环 - 像普通ping一样持续发送
+    while is_running() {
+        // 检查是否达到了count限制
+        if let Some(count) = pgConfig.count {
+            if status.transmitted >= count {
+                debug!("Nodeinfo count reached, stopping...");
+                break;
+            }
+        }
+
+        // 构造 nodeinfo 查询包
+        let nodeinfo_packet = build_nodeinfo_packet(&pgConfig.nodeinfo_opt, pgConfig)?;
+
+        // 发送查询
+        let send_time = Instant::now();
+        match socket.send_to(&nodeinfo_packet, &sock_addr) {
+            Ok(_) => {
+                status.transmitted += 1;
+                debug!("Nodeinfo query {} sent", seq);
+            }
+            Err(e) => {
+                error!("Failed to send nodeinfo query: {}", e);
+                continue;
+            }
+        }
+
+        // 接收回复 (with timeout)
+        let mut buffer = Box::new([std::mem::MaybeUninit::<u8>::uninit(); 1500]);
+
+        match socket.recv_from(&mut *buffer) {
+            Ok((size, addr)) => {
+                let elapsed = send_time.elapsed();
+                debug!(
+                    "Received nodeinfo response: {} bytes in {:?}",
+                    size, elapsed
+                );
+
+                let packet = Icmpv6Packet::new(unsafe {
+                    std::slice::from_raw_parts(buffer.as_ptr() as *const u8, size)
+                })
+                .ok_or(anyhow::anyhow!("Invalid ICMPv6 packet"))?;
+
+                // 解析 nodeinfo 回复
+                let has_real_reply = parse_nodeinfo_reply(&packet, pgConfig)?;
+
+                if has_real_reply {
+                    let rtt_ms = elapsed.as_secs_f64() * 1000.0;
+                    status.update(rtt_ms);
+                    println!(
+                        "Reply from {}: {} bytes, time={:.3}ms",
+                        addr.as_socket_ipv6()
+                            .map(|s| s.ip().to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        size,
+                        rtt_ms
+                    );
+                } else {
+                    debug!("Got echo/loopback response, not counting as received");
+                }
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    debug!("Nodeinfo query {} timed out", seq);
+                } else {
+                    error!("Failed to receive nodeinfo reply: {}", e);
+                }
+            }
+        }
+
+        seq += 1;
+
+        // 间隔等待 - 与普通ping一样
+        if pgConfig.interval > Duration::from_secs(0) {
+            std::thread::sleep(pgConfig.interval);
+        } else {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    // 打印统计信息
+    status.print_summary(&target.to_string());
+
+    Ok(())
+}
+
+// 构造 IPv6 nodeinfo 查询包
+fn build_nodeinfo_packet(
+    nodeinfo_opt: &str,
+    _config: &PingConfig,
+) -> Result<Vec<u8>, anyhow::Error> {
+    // ICMPv6 Node Information Query 的类型为 139
+    const ICMPV6_NI_QUERY: u8 = 139;
+
+    // 构造基本的 nodeinfo 查询包
+    let mut packet = vec![0u8; 24]; // 基本头部大小
+
+    packet[0] = ICMPV6_NI_QUERY; // Type
+    packet[1] = 0; // Code
+    packet[2] = 0; // Checksum (will be calculated later)
+    packet[3] = 0; // Checksum
+
+    // Qtype (query type) 根据 nodeinfo 选项设置
+    let qtype: u16 = match nodeinfo_opt {
+        "name" => 2,            // Node Name
+        "ipv6" => 0,            // IPv6 Address
+        "ipv6-all" => 0,        // All IPv6 Addresses
+        "ipv6-compatible" => 0, // IPv4-compatible IPv6
+        "ipv6-global" => 0,     // Global IPv6
+        "ipv6-linklocal" => 0,  // Link-local IPv6
+        "ipv6-sitelocal" => 0,  // Site-local IPv6
+        "ipv4" => 1,            // IPv4 Address
+        "ipv4-all" => 1,        // All IPv4 Addresses
+        _ => {
+            warn!("Unsupported nodeinfo query type: {}", nodeinfo_opt);
+            2 // 默认为 name 查询
+        }
+    };
+
+    packet[4..6].copy_from_slice(&qtype.to_be_bytes());
+
+    // Flags
+    packet[6..8].copy_from_slice(&0u16.to_be_bytes());
+
+    // Nonce (8 bytes random - using timestamp for uniqueness)
+    let nonce: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    packet[8..16].copy_from_slice(&nonce.to_be_bytes());
+
+    // Subject (8 bytes, 可以是 IPv6 地址的一部分)
+    packet[16..24].copy_from_slice(&[0u8; 8]);
+
+    debug!(
+        "Built nodeinfo packet: {} bytes, qtype: {}",
+        packet.len(),
+        qtype
+    );
+    Ok(packet)
+}
+
+// 解析 IPv6 nodeinfo 回复
+fn parse_nodeinfo_reply(
+    packet: &Icmpv6Packet,
+    _config: &PingConfig,
+) -> Result<bool, anyhow::Error> {
+    debug!("Parsing nodeinfo reply");
+
+    let icmp_type = packet.get_icmpv6_type();
+    debug!("ICMPv6 type: {:?}", icmp_type);
+
+    // ICMPv6 Node Information Reply 的类型为 140
+    let packet_type = packet.packet()[0];
+    if packet_type == 140 {
+        debug!("Received ICMPv6 Node Information Reply");
+        // 真正的 nodeinfo 回复，继续解析
+    } else if packet_type == 139 {
+        debug!("Received ICMPv6 Node Information Query (echo/loopback)");
+        // 这通常发生在本地回环或者目标不支持 nodeinfo 但会回显包的情况
+        // 根据原生ping行为，这种情况应该视为无回复（100% packet loss）
+        return Ok(false); // 没有真正的回复，与原生ping行为一致
+    } else {
+        debug!("Not a nodeinfo packet, type: {}", packet_type);
+        return Ok(false);
+    }
+
+    let payload = packet.payload();
+    if payload.len() < 8 {
+        debug!("Nodeinfo reply too short");
+        return Ok(false);
+    }
+
+    // 解析 qtype
+    let qtype = u16::from_be_bytes([payload[0], payload[1]]);
+    let flags = u16::from_be_bytes([payload[2], payload[3]]);
+
+    debug!("Nodeinfo reply - qtype: {}, flags: 0x{:x}", qtype, flags);
+
+    // 解析数据部分（从第8字节开始）
+    if payload.len() > 8 {
+        let data = &payload[8..];
+        match qtype {
+            2 => {
+                // Node Name
+                if let Ok(name) = std::str::from_utf8(data) {
+                    println!("Node name: {}", name.trim_end_matches('\0'));
+                } else {
+                    println!("Node name: (binary data, {} bytes)", data.len());
+                }
+            }
+            0 => {
+                // IPv6 Address
+                println!("IPv6 addresses: {} bytes of data", data.len());
+                for chunk in data.chunks(16) {
+                    if chunk.len() == 16 {
+                        let mut addr_bytes = [0u8; 16];
+                        addr_bytes.copy_from_slice(chunk);
+                        let addr = Ipv6Addr::from(addr_bytes);
+                        println!("  {}", addr);
+                    }
+                }
+            }
+            1 => {
+                // IPv4 Address
+                println!("IPv4 addresses: {} bytes of data", data.len());
+                for chunk in data.chunks(4) {
+                    if chunk.len() == 4 {
+                        let addr = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+                        println!("  {}", addr);
+                    }
+                }
+            }
+            _ => {
+                println!(
+                    "Unknown nodeinfo data type: {}, {} bytes",
+                    qtype,
+                    data.len()
+                );
+            }
+        }
+    } else {
+        println!("No data in nodeinfo reply");
+    }
+
+    Ok(true) // 有真正的回复
+}
