@@ -424,3 +424,196 @@ fn receive_ip_reply_with_timestamp(
         Err(e) => Err(anyhow::anyhow!("Error receiving packet: {}", e)),
     }
 }
+
+// 解析和显示时间戳信息 - 修正时间戳计算逻辑
+fn print_timestamp_info(option_data: &[u8], _config: &PingConfig) {
+    if option_data.len() < 4 {
+        return;
+    }
+
+    let length = option_data[1] as usize;
+    let pointer = option_data[2] as usize;
+    let flags = option_data[3];
+    let flag = flags & 0x0F;
+
+    debug!(
+        "Timestamp Option: length={}, pointer={}, flags=0x{:x}, len={}",
+        length,
+        pointer,
+        flags,
+        option_data.len()
+    );
+
+    let timestamp_data = &option_data[4..];
+
+    if flag == 0 {
+        // tsonly 模式：仅时间戳
+        if timestamp_data.len() >= 4 {
+            // 解析第一个时间戳
+            let first_timestamp = u32::from_be_bytes([
+                timestamp_data[0],
+                timestamp_data[1],
+                timestamp_data[2],
+                timestamp_data[3],
+            ]);
+
+            // 显示时间戳信息，使用英文以匹配原生ping
+            println!("TS:     {} absolute", first_timestamp);
+
+            // 收集所有有效的时间戳
+            let mut timestamps = vec![first_timestamp];
+
+            // 计算最大可能的时间戳数量（基于选项长度）
+            let max_timestamps = (length - 4) / 4; // 减去头部4字节，除以每个时间戳4字节
+            debug!("Max possible timestamps: {}", max_timestamps);
+
+            // 尝试解析更多时间戳，目标是获得4个时间戳以匹配原生ping
+            for i in 1..max_timestamps.min(9) {
+                // 最多解析9个时间戳
+                let offset = i * 4;
+                if offset + 3 < timestamp_data.len() {
+                    let ts = u32::from_be_bytes([
+                        timestamp_data[offset],
+                        timestamp_data[offset + 1],
+                        timestamp_data[offset + 2],
+                        timestamp_data[offset + 3],
+                    ]);
+
+                    timestamps.push(ts);
+                    debug!("Timestamp {}: {}", i + 1, ts);
+
+                    // 如果我们已经有4个时间戳且找到合理的停止点，就停止
+                    if timestamps.len() >= 4 {
+                        // 检查后续时间戳是否都是0，如果是则可以停止
+                        let mut all_zero_after = true;
+                        for j in i + 1..max_timestamps.min(9) {
+                            let next_offset = j * 4;
+                            if next_offset + 3 < timestamp_data.len() {
+                                let next_ts = u32::from_be_bytes([
+                                    timestamp_data[next_offset],
+                                    timestamp_data[next_offset + 1],
+                                    timestamp_data[next_offset + 2],
+                                    timestamp_data[next_offset + 3],
+                                ]);
+                                if next_ts != 0 {
+                                    all_zero_after = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_zero_after {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            debug!("Found {} timestamps", timestamps.len());
+
+            // 显示时间戳的相对差值
+            for i in 1..timestamps.len() {
+                let diff = timestamps[i] as i64 - timestamps[i - 1] as i64;
+
+                // 检测异常大的差值，可能表明时间戳未被正确填充
+                if diff.abs() > 1000000 {
+                    // 如果差值超过1000秒，可能是异常值
+                    debug!("Detected abnormal timestamp diff: {}, stopping", diff);
+                    break;
+                }
+
+                println!("        {}", diff);
+            }
+        }
+    } else if flag == 1 {
+        // tsandaddr 模式：时间戳和地址交替
+        if timestamp_data.len() >= 8 {
+            // 至少需要一个地址(4字节) + 时间戳(4字节)
+
+            // 解析第一对：地址 + 时间戳
+            let first_addr = Ipv4Addr::new(
+                timestamp_data[0],
+                timestamp_data[1],
+                timestamp_data[2],
+                timestamp_data[3],
+            );
+            let first_timestamp = u32::from_be_bytes([
+                timestamp_data[4],
+                timestamp_data[5],
+                timestamp_data[6],
+                timestamp_data[7],
+            ]);
+
+            // 显示第一行：地址 + 时间戳 + absolute
+            println!("TS:     {}     {} absolute", first_addr, first_timestamp);
+
+            // 收集所有地址和时间戳对
+            let mut timestamps = vec![first_timestamp];
+            let max_pairs = (length - 4) / 8; // 每对占用8字节
+            debug!("Max possible address-timestamp pairs: {}", max_pairs);
+
+            // 解析后续的地址-时间戳对
+            for i in 1..max_pairs.min(9) {
+                let offset = i * 8;
+                if offset + 7 < timestamp_data.len() {
+                    let addr = Ipv4Addr::new(
+                        timestamp_data[offset],
+                        timestamp_data[offset + 1],
+                        timestamp_data[offset + 2],
+                        timestamp_data[offset + 3],
+                    );
+                    let ts = u32::from_be_bytes([
+                        timestamp_data[offset + 4],
+                        timestamp_data[offset + 5],
+                        timestamp_data[offset + 6],
+                        timestamp_data[offset + 7],
+                    ]);
+
+                    timestamps.push(ts);
+                    debug!("Address-Timestamp pair {}: {} - {}", i + 1, addr, ts);
+
+                    // 计算与前一个时间戳的差值
+                    let diff = ts as i64 - timestamps[timestamps.len() - 2] as i64;
+
+                    // 检测异常差值
+                    if diff.abs() > 1000000 {
+                        debug!("Detected abnormal timestamp diff: {}, stopping", diff);
+                        break;
+                    }
+
+                    // 显示：地址 + 差值
+                    println!("        {}     {}", addr, diff);
+                }
+            }
+        }
+    } else {
+        debug!("Unsupported timestamp flag: {}", flag);
+    }
+}
+
+fn send_icmp_requests(
+    socket: &Socket,
+    target: Ipv4Addr,
+    pgConfig: &PingConfig,
+    seq: u16,
+    status: &mut PingStats,
+) -> Result<(), anyhow::Error> {
+    let mut start_seq = seq;
+    for _ in 0..pgConfig.preload {
+        let request = IcmpEchoRequest::new(start_seq, pgConfig.identifier, pgConfig.packet_size);
+        let packet = request.build_packet(pgConfig);
+
+        // 重新设置 RR 选项，确保每个包的指针都从 4 开始
+        if pgConfig.record_route {
+            // 忽略可能的错误，因为部分系统内核可能不支持重复设置
+            let _ = set_record_route_option(socket, false);
+        }
+
+        status.record_sent_time(start_seq);
+
+        if let Err(e) = send_icmp_request(socket, target, &packet) {
+            error!("Failed to send ICMP request: {}", e);
+        }
+        start_seq = start_seq.wrapping_add(1);
+    }
+    Ok(())
+}
