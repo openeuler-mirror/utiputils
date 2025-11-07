@@ -24,6 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::iputils_common::{get_ipv4_addr, init_logger, initialize_signal_handler, is_running};
+
 // ARP 包结构长度常量
 const ETHERNET_HEADER_LEN: usize = 14;
 const ARP_PACKET_LEN: usize = 28;
@@ -141,6 +143,232 @@ fn validate_source_ip_on_interface(interface: &NetworkInterface, source_ip: Ipv4
         }
     }
     false
+}
+
+fn arping_run(target_ip: Ipv4Addr, options: &mut ArpingConfig) -> Result<bool, anyhow::Error> {
+    let interface = if let Some(ref device) = options.device {
+        find_interface(device)
+    } else {
+        find_best_interface_for_target(target_ip).unwrap_or_else(|| {
+            eprintln!(
+                "utarping: No suitable network interface found for target {}",
+                target_ip
+            );
+            eprintln!("Try specifying an interface with -I option");
+            process::exit(1);
+        })
+    };
+
+    let mut src_ip = if let Some(ref source_str) = options.source {
+        // 解析用户指定的源IP地址
+        let parsed_source = source_str.parse::<Ipv4Addr>().unwrap_or_else(|_| {
+            eprintln!("utarping: invalid source {}", source_str);
+            process::exit(2);
+        });
+
+        // 验证源IP是否在接口的网络段内（可选的警告，不强制）
+        if !validate_source_ip_on_interface(&interface, parsed_source) && !options.quiet {
+            println!(
+                "Warning: Source IP {} may not be reachable via interface {}",
+                parsed_source, interface.name
+            );
+        }
+
+        parsed_source
+    } else {
+        // 使用接口的IP地址
+        get_interface_ip(&interface).unwrap_or_else(|| {
+            eprintln!("utarping: Interface {} has no IPv4 address", interface.name);
+            process::exit(1);
+        })
+    };
+
+    // -A 模式且未显式指定 -s：按照 iputils 规则使用 target_ip 作为源
+    if options.arp_answer && options.source.is_none() {
+        src_ip = target_ip;
+    }
+
+    // -A 模式要求目标 IP 必须属于所选接口，否则报错并退出
+    if options.arp_answer && !validate_ip_on_interface(&interface, IpAddr::V4(target_ip)) {
+        eprintln!("utarping: bind: Cannot assign requested address");
+        process::exit(2);
+    }
+
+    let src_mac = interface.mac.unwrap_or_else(|| {
+        eprintln!("utarping: Interface {} has no MAC address", interface.name);
+        process::exit(1);
+    });
+
+    let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+        Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => {
+            eprintln!(
+                "utarping: Unhandled channel type for interface {}",
+                interface.name
+            );
+            process::exit(1);
+        }
+        Err(e) => {
+            match e.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    eprintln!("utarping: Operation not permitted");
+                    eprintln!("Try running with sudo or as root user");
+                }
+                _ => {
+                    eprintln!("utarping: Failed to create channel: {}", e);
+                }
+            }
+            process::exit(1);
+        }
+    };
+
+    let mut state = ArgState::new();
+
+    // 处理 -U 未经请求的ARP
+    let (src_ip, target_ip) = if options.unsolicited_arp {
+        if !validate_ip_on_interface(&interface, IpAddr::V4(target_ip)) {
+            eprintln!(
+                "utarping: Target IP address {} is not on interface {}",
+                target_ip, interface.name
+            );
+            process::exit(1);
+        }
+        (src_ip, src_ip) // 源和目标IP相同
+    } else if options.duplicate_address_detection {
+        // DAD模式：使用0.0.0.0作为源IP，不验证目标IP是否在接口上
+        (Ipv4Addr::UNSPECIFIED, target_ip) // 0.0.0.0 检测冲突
+    } else {
+        (src_ip, target_ip)
+    };
+
+    let mut sent_count = 0;
+    let mut reply_count = 0;
+    let mut broadcast_count = 0;
+    let start_time = Instant::now();
+
+    if !options.quiet {
+        println!("ARPING {} from {} {}", target_ip, src_ip, interface.name);
+    }
+
+    'outer: loop {
+        if !is_running() {
+            // 尝试在退出前快速读取可能已到达但尚未处理的应答，以减少 sent/recv 不匹配
+            let drain_deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < drain_deadline {
+                match rx.next() {
+                    Ok(packet) => {
+                        if let Some(mac) = parse_arp_reply(packet, target_ip) {
+                            reply_count += 1;
+                            if !options.quiet {
+                                println!(
+                                    "Unicast reply from {} [{}]  (late)",
+                                    target_ip,
+                                    mac.to_string().to_uppercase()
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            break;
+        }
+
+        if let Some(count) = options.count {
+            if sent_count >= count {
+                break;
+            }
+        }
+        if let Some(timeout) = options.timeout {
+            if start_time.elapsed().as_secs() > timeout as u64 {
+                info!("Timeout reached");
+                break;
+            }
+        }
+
+        let buffer = build_arp_packet(options, &state, src_mac, src_ip, target_ip);
+        tx.send_to(&buffer, None);
+
+        sent_count += 1;
+        if state.should_broadcast() {
+            broadcast_count += 1;
+        }
+
+        debug!("send buffer: {:?}", buffer);
+
+        let wait_duration = Duration::from_secs(options.interval.unwrap_or(1) as u64);
+        let start_wait = Instant::now();
+
+        loop {
+            if !is_running() {
+                break;
+            }
+
+            match rx.next() {
+                Ok(packet) => {
+                    if let Some(mac) = parse_arp_reply(packet, target_ip) {
+                        reply_count += 1;
+
+                        let duration = start_wait.elapsed();
+                        let millis = duration.as_secs_f64() * 1000.0;
+
+                        if options.quiet {
+                            // 仅计数，不打印
+                        } else {
+                            debug!(
+                                "Received reply from {} [{}]: {:.3}ms",
+                                target_ip, mac, millis
+                            );
+                            println!(
+                                "Unicast reply from {} [{}]  {:.3}ms",
+                                target_ip,
+                                mac.to_string().to_uppercase(),
+                                millis
+                            );
+                        }
+
+                        if options.quit_on_first_reply {
+                            info!("Quit on first reply");
+                            break 'outer;
+                        }
+
+                        // 如果是广播模式，不修改状态
+                        if !options.broadcast_only {
+                            state.update(mac); // 更新状态，后续单播
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to receive packet: {}", e);
+                    // 出现错误直接停止等待
+                    break;
+                }
+            }
+
+            // 达到等待时长后退出等待循环，准备发送下一包
+            if start_wait.elapsed() >= wait_duration {
+                break;
+            }
+        }
+    }
+
+    if !options.quiet {
+        print_summary(sent_count, reply_count, broadcast_count);
+    }
+
+    // 不同模式的退出码判定
+    let success = if options.duplicate_address_detection {
+        // DAD：若收到响应说明地址冲突 → 失败
+        reply_count == 0
+    } else if options.unsolicited_arp {
+        // -U 模式：始终返回成功
+        true
+    } else {
+        // 普通模式：全部收到即成功
+        sent_count == reply_count
+    };
+
+    Ok(success)
 }
 
 fn print_summary(sent_count: u32, reply_count: u32, broadcast_count: u32) {
