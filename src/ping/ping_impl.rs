@@ -85,6 +85,15 @@ pub fn main() {
     let mut pgconfig = PingConfig::from_args();
 
     debug!("Config: {:?}", pgconfig);
+
+    initialize_signal_handler();
+    pgconfig.initStartTime();
+
+    if let Err(err) = main_ping(&mut pgconfig) {
+        eprintln!("ping: {}", err);
+        error!("Error running ping: {}", err);
+        std::process::exit(1);
+    }
 }
 
 fn parseflow(str: &str) -> Result<u32, anyhow::Error> {
@@ -95,6 +104,222 @@ fn parseflow(str: &str) -> Result<u32, anyhow::Error> {
     };
 
     Ok(val)
+}
+
+fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
+    let mut ips: Vec<IpAddr> = Vec::new();
+
+    // Verbose output for socket information (before DNS resolution)
+    if pgConfig.verbose {
+        // 原生 ping 显示两个 socket fd，我们简化为显示协议族信息
+        println!("ping: sock4.fd: 3 (socktype: SOCK_RAW), sock6.fd: 4 (socktype: SOCK_RAW), hints.ai_family: AF_UNSPEC");
+        println!();
+    }
+
+    // 解析目标地址
+    let host = pgConfig.host.as_ref().unwrap(); // 在这里已经验证过 host 不为 None
+
+    // 如果启用 IPv6 且是 nodeinfo 查询，使用特殊处理
+    if pgConfig.force_ipv6 && !pgConfig.nodeinfo_opt.is_empty() {
+        info!("Running IPv6 nodeinfo query");
+        // 对于 nodeinfo 查询，直接解析地址而不进行扩展查找
+        // match host.parse::<IpAddr>() {
+        //     Ok(ip) => {
+        //         if let IpAddr::V6(ipv6) = ip {
+        //             return ping6_run(ipv6, pgConfig);
+        //         } else {
+        //             anyhow::bail!("{}: Address family for hostname not supported", host);
+        //         }
+        //     }
+        //     Err(_) => {
+        //         anyhow::bail!("{}: Address family for hostname not supported", host);
+        //     }
+        // }
+    }
+
+    // 普通ping流程：查找并扩展IP地址
+    match host.parse::<IpAddr>() {
+        Ok(ip) => {
+            // 输入是IP地址
+            info!("Target is an IP address: {}", ip);
+            pgConfig.is_direct_ip_input = true;
+            ips.push(ip);
+
+            // Verbose output for IP address
+            if pgConfig.verbose {
+                let family = if ip.is_ipv4() { "AF_INET" } else { "AF_INET6" };
+                println!("ai->ai_family: {}, ai->ai_canonname: '{}'", family, host);
+            }
+        }
+        Err(_) => {
+            // 输入是域名，需要DNS解析
+            info!("Target is a domain name: {}", host);
+            pgConfig.is_direct_ip_input = false;
+            let resolver = Resolver::from_system_conf().context("Failed to create resolver")?;
+
+            // 先查询 CNAME 记录获取 canonical name
+            let canonical_name = resolver
+                .lookup(host, RecordType::CNAME)
+                .ok()
+                .and_then(|r| r.into_iter().next())
+                .map(|c| c.to_string().trim_end_matches('.').to_string())
+                .unwrap_or_else(|| host.to_string());
+
+            // 更新配置中的域名为canonical name
+            pgConfig.domain = canonical_name.clone();
+
+            // 根据强制选项确定查询类型
+            match (pgConfig.force_ipv4, pgConfig.force_ipv6) {
+                (true, _) => {
+                    // 只查询IPv4
+                    lookup_and_extend_ips(&resolver, host, RecordType::A, &mut ips)?;
+                    if pgConfig.verbose && !ips.is_empty() {
+                        println!(
+                            "ai->ai_family: AF_INET, ai->ai_canonname: '{}'",
+                            canonical_name
+                        );
+                    }
+                }
+                (_, true) => {
+                    // 只查询IPv6
+                    lookup_and_extend_ips(&resolver, host, RecordType::AAAA, &mut ips)?;
+                    if pgConfig.verbose && !ips.is_empty() {
+                        println!(
+                            "ai->ai_family: AF_INET6, ai->ai_canonname: '{}'",
+                            canonical_name
+                        );
+                    }
+                }
+                _ => {
+                    // 查询IPv6和IPv4，根据域名确定优先级
+                    // 对于localhost，保持IPv6优先（符合现代系统配置）
+                    // 对于其他域名，优先IPv4（确保更好的连通性）
+
+                    if host == "localhost" {
+                        // localhost特殊处理：IPv6优先
+                        if let Err(e) =
+                            lookup_and_extend_ips(&resolver, host, RecordType::AAAA, &mut ips)
+                        {
+                            debug!("IPv6 lookup failed for localhost: {}", e);
+                        }
+
+                        if let Err(e) =
+                            lookup_and_extend_ips(&resolver, host, RecordType::A, &mut ips)
+                        {
+                            debug!("IPv4 lookup failed for localhost: {}", e);
+                        }
+                    } else {
+                        // 其他域名：IPv4优先，提高连通性
+                        if let Err(e) =
+                            lookup_and_extend_ips(&resolver, host, RecordType::A, &mut ips)
+                        {
+                            debug!("IPv4 lookup failed: {}", e);
+                        }
+
+                        if let Err(e) =
+                            lookup_and_extend_ips(&resolver, host, RecordType::AAAA, &mut ips)
+                        {
+                            debug!("IPv6 lookup failed: {}", e);
+                        }
+                    }
+
+                    // 对于 verbose 输出，我们延迟到确定实际使用的地址族后再显示
+                    // 这样就可以与原生 ping 保持一致，只显示实际使用的地址族
+                }
+            }
+
+            ips.dedup();
+        }
+    }
+
+    // 检查解析结果
+    if ips.is_empty() {
+        anyhow::bail!("ping: {}: Name or service not known", host);
+    }
+
+    // 根据强制选项过滤IP
+    let filtered_ips: Vec<IpAddr> = if pgConfig.force_ipv4 {
+        ips.into_iter().filter(|ip| ip.is_ipv4()).collect()
+    } else if pgConfig.force_ipv6 {
+        ips.into_iter().filter(|ip| ip.is_ipv6()).collect()
+    } else {
+        ips
+    };
+
+    if filtered_ips.is_empty() && (pgConfig.force_ipv4 || pgConfig.force_ipv6) {
+        anyhow::bail!("{}: Address family for hostname not supported", host);
+    }
+
+    // 使用第一个可用的IP地址进行ping
+    let target_ip = filtered_ips[0];
+
+    // 如果是域名解析且没有强制指定地址族，现在显示实际使用的地址族信息
+    if pgConfig.verbose
+        && host.parse::<IpAddr>().is_err()
+        && !pgConfig.force_ipv4
+        && !pgConfig.force_ipv6
+    {
+        // 先查询 CNAME 记录获取 canonical name
+        if let Ok(resolver) = Resolver::from_system_conf() {
+            let canonical_name = resolver
+                .lookup(host, RecordType::CNAME)
+                .ok()
+                .and_then(|r| r.into_iter().next())
+                .map(|c| c.to_string().trim_end_matches('.').to_string())
+                .unwrap_or_else(|| host.to_string());
+
+            let family = if target_ip.is_ipv4() {
+                "AF_INET"
+            } else {
+                "AF_INET6"
+            };
+            println!(
+                "ai->ai_family: {}, ai->ai_canonname: '{}'",
+                family, canonical_name
+            );
+        }
+    }
+
+    match target_ip {
+        IpAddr::V4(ipv4) => {
+            info!("Running ping4 for address: {}", ipv4);
+            // if let Err(e) = ping4_run(ipv4, pgConfig) {
+            //     // 检查是否是权限错误
+            //     let error_msg = e.to_string();
+            //     if error_msg.contains("Permission denied")
+            //         || error_msg.contains("Operation not permitted")
+            //         || error_msg.contains("Failed to create socket")
+            //     {
+            //         eprintln!("utping: socket: Operation not permitted");
+            //         std::process::exit(1);
+            //     } else {
+            //         eprintln!("utping: {}", e);
+            //         std::process::exit(1);
+            //     }
+            // }
+            info!("Ping4 run completed");
+        }
+        IpAddr::V6(ipv6) => {
+            info!("Running ping6 for address: {}", ipv6);
+            // if let Err(e) = ping6_run(ipv6, pgConfig) {
+            //     // 检查是否是权限错误
+            //     let error_msg = e.to_string();
+            //     if error_msg.contains("Permission denied")
+            //         || error_msg.contains("Operation not permitted")
+            //         || error_msg.contains("Failed to create socket")
+            //     {
+            //         eprintln!("utping: socket: Operation not permitted");
+            //         std::process::exit(1);
+            //     } else {
+            //         eprintln!("utping: {}", e);
+            //         std::process::exit(1);
+            //     }
+            // }
+            info!("Ping6 run completed");
+        }
+    }
+
+    Ok(())
 }
 
 pub fn create_icmpv4_socket(pgConfig: &mut PingConfig) -> Result<socket2::Socket, anyhow::Error> {
