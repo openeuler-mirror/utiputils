@@ -124,6 +124,64 @@ impl ArgState {
     }
 }
 
+pub fn main() {
+    // 初始化日志记录器
+    init_logger();
+
+    info!("arping started");
+    let mut options = ArpingConfig::from_args();
+
+    // DAD模式的特殊处理
+    if options.duplicate_address_detection {
+        // DAD模式默认在收到第一个回复时退出
+        options.quit_on_first_reply = true;
+        // 如果没有指定count，DAD模式默认发送1个包
+        if options.count.is_none() {
+            options.count = Some(1);
+        }
+    }
+
+    // ARP answer(-A) 模式应隐式启用-U（advertisement/unsolicited），与 iputils 一致
+    if options.arp_answer {
+        options.unsolicited_arp = true;
+    }
+
+    initialize_signal_handler();
+
+    // 解析输入地址是否为ipv4地址
+    let target_ip = options.destination.clone();
+
+    let (target_cname, target_ips) = get_ipv4_addr(&target_ip).unwrap_or_else(|e| {
+        eprintln!("utarping: Failed to resolve target '{}': {}", target_ip, e);
+        process::exit(1);
+    });
+    debug!("Target CNAME: {}", target_cname);
+    debug!("Target IPs: {:?}", target_ips);
+
+    let mut all_success = true;
+    for ip in target_ips {
+        if !is_running() {
+            break;
+        }
+        match arping_run(ip, &mut options) {
+            Ok(ok) => {
+                if !ok {
+                    all_success = false;
+                }
+            }
+            Err(e) => {
+                error!("Failed to run arping: {}", e);
+                all_success = false;
+                break;
+            }
+        }
+        info!("arping finished: {}", ip.to_string());
+    }
+
+    // 这里可以添加更多的逻辑来处理解析后的选项
+    process::exit(if all_success { 0 } else { 1 });
+}
+
 fn validate_ip_on_interface(interface: &NetworkInterface, ip: IpAddr) -> bool {
     for ip_network in &interface.ips {
         if ip_network.ip() == ip {
