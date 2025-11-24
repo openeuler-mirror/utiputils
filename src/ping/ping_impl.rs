@@ -842,3 +842,509 @@ fn send_icmp_requests(
     }
     Ok(())
 }
+
+fn receive_icmp_replies(
+    socket: &Socket,
+    identifier: u16,
+    pgConfig: &PingConfig,
+    status: &mut PingStats,
+) -> Result<(), anyhow::Error> {
+    debug!("Receiving ICMP replies: {:?}", status.sent_times);
+    for _ in 0..pgConfig.preload {
+        if !is_running() {
+            break;
+        }
+        match receive_icmp_reply(socket, identifier) {
+            Ok(reply) => {
+                let receive_seq = reply.sequence;
+                if let Some(sent_time) = status.get_sent_time(receive_seq) {
+                    let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0; // 转换为毫秒
+                    print!(".");
+                    let _ = std::io::stdout().flush();
+
+                    if pgConfig.audible {
+                        print!("\x07");
+                        let _ = std::io::stdout().flush();
+                    }
+                    print!("\x08");
+                    let _ = std::io::stdout().flush();
+
+                    // 显示Record Route信息
+                    if let Some(data) = reply.ip_options {
+                        parse_record_route_option(&data, pgConfig);
+                    }
+
+                    status.update(rtt);
+                    debug!(
+                        "ICMP reply received: seq={}, size={}, src={}, ttl={}",
+                        reply.sequence, reply.bytes_received, reply.source_ip, reply.ttl
+                    );
+                } else {
+                    error!("Failed to find sent time for seq={}", receive_seq);
+                }
+            }
+            Err(e) => {
+                // 检查是否是ICMP错误（destination unreachable等）
+                let error_msg = e.to_string();
+                if error_msg.contains("Destination unreachable")
+                    || error_msg.contains("Time exceeded")
+                    || error_msg.contains("Parameter problem")
+                {
+                    status.record_error();
+                } else {
+                    error!("Failed to receive ICMP reply: {}", e);
+                }
+            }
+        }
+
+        if timeout_or_count_exit(pgConfig, status) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn preload_send_and_receive(
+    socket: &Socket,
+    target: Ipv4Addr,
+    pgConfig: &PingConfig,
+    status: &mut PingStats,
+) -> Result<(), anyhow::Error> {
+    send_icmp_requests(socket, target, pgConfig, 1, status)?;
+    receive_icmp_replies(socket, pgConfig.identifier, pgConfig, status)?;
+    Ok(())
+}
+
+fn flood_ping(
+    socket: &Socket,
+    target: Ipv4Addr,
+    pgConfig: &PingConfig,
+    status: &mut PingStats,
+) -> Result<(), anyhow::Error> {
+    let mut start_seq = 1;
+    loop {
+        if !is_running() {
+            info!("exit flood mode");
+            break;
+        }
+        let request = IcmpEchoRequest::new(start_seq, pgConfig.identifier, pgConfig.packet_size);
+        let packet = request.build_packet(pgConfig);
+
+        // 重新设置 RR 选项，确保每个包的指针都从 4 开始
+        if pgConfig.record_route {
+            // 忽略可能的错误，因为部分系统内核可能不支持重复设置
+            let _ = set_record_route_option(socket, false);
+        }
+
+        status.record_sent_time(start_seq);
+
+        if let Err(e) = send_icmp_request(socket, target, &packet) {
+            error!("Failed to send ICMP request: {}", e);
+        }
+
+        // Print a dot for each sent packet
+        print!(".");
+        let _ = std::io::stdout().flush();
+
+        // 洪水模式使用短超时接收，避免阻塞太久
+        match receive_icmp_reply_with_timeout(
+            socket,
+            pgConfig.identifier,
+            Duration::from_millis(10),
+        ) {
+            Ok(reply) => {
+                let receive_seq = reply.sequence;
+                if let Some(sent_time) = status.get_sent_time(receive_seq) {
+                    let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0;
+
+                    print!("\x08");
+                    let _ = std::io::stdout().flush();
+
+                    // 更新统计信息
+                    status.update(rtt);
+
+                    // 显示Record Route信息
+                    if let Some(data) = reply.ip_options {
+                        parse_record_route_option(&data, pgConfig);
+                    }
+                } else {
+                    error!("Failed to find sent time for seq={}", receive_seq);
+                }
+            }
+            Err(e) => {
+                // 检查是否是ICMP错误（destination unreachable等）
+                let error_msg = e.to_string();
+                if error_msg.contains("Destination unreachable")
+                    || error_msg.contains("Time exceeded")
+                    || error_msg.contains("Parameter problem")
+                {
+                    status.record_error();
+                } else {
+                    // 在洪水模式下，超时是正常的，不需要记录错误
+                    debug!("Failed to receive ICMP reply in flood mode: {}", e);
+                }
+            }
+        }
+
+        start_seq = start_seq.wrapping_add(1);
+        thread::sleep(Duration::from_millis(25));
+
+        if timeout_or_count_exit(pgConfig, status) {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
+    info!("create_icmp_socket ...");
+
+    let mut status = PingStats::new();
+    status.start_time = Some(Instant::now());
+
+    // 先创建socket，这样权限错误会在显示标题前捕获
+    let socket = create_icmpv4_socket(pgConfig)?;
+
+    // 如果使用了pattern，先显示pattern信息（匹配原生ping行为）
+    if !pgConfig.pattern.is_empty() {
+        println!("PATTERN: 0x{}", hex::encode(&pgConfig.pattern));
+    }
+
+    // 只有socket创建成功才显示标题
+    print_titile(IpAddr::V4(target), pgConfig);
+
+    if pgConfig.connect_sk {
+        info!("Connecting to target: {}", target);
+        socket
+            .connect(&SockAddr::from(SocketAddrV4::new(target, 0)))
+            .context("Failed to connect to target")?;
+    }
+
+    // 洪水模式
+    if pgConfig.flood {
+        flood_ping(&socket, target, pgConfig, &mut status)?;
+        status.print_summary(&pgConfig.domain);
+        return Ok(());
+    }
+
+    // 预加载模式
+    if pgConfig.preload > 0 {
+        info!("Preloading {} ICMP requests", pgConfig.preload);
+        preload_send_and_receive(&socket, target, pgConfig, &mut status)?;
+
+        thread::sleep(Duration::from_secs(1));
+
+        if timeout_or_count_exit(pgConfig, &status) {
+            status.print_summary(&pgConfig.domain);
+            return Ok(());
+        }
+    }
+
+    info!("Start pinging target: {}", target.to_string());
+    let mut seq = pgConfig.preload + 1;
+    let mut smoothed_rtt: Option<f64> = None;
+    const ALPHA: f64 = 0.125; // 平滑因子
+
+    while is_running() {
+        let request = IcmpEchoRequest::new(seq, pgConfig.identifier, pgConfig.packet_size);
+        let packet = request.build_packet(pgConfig);
+        debug!("Sending ICMP packet: seq={}", seq);
+        debug!(
+            "Built packet length: {}, first 16 bytes: {:?}",
+            packet.len(),
+            &packet[..std::cmp::min(16, packet.len())]
+        );
+
+        // 重新设置 RR 选项，确保每个包的指针都从 4 开始，放在发送之前
+        if pgConfig.record_route {
+            // 忽略可能的错误，因为部分系统内核可能不支持重复设置
+            if let Err(e) = set_record_route_option(&socket, false) {
+                debug!("reset RR option failed: {}", e);
+            }
+        }
+
+        // 发送ICMP包
+        status.record_sent_time(seq);
+        if let Err(e) = send_icmp_request(&socket, target, &packet) {
+            error!("Failed to send ICMP request: {}", e);
+            break;
+        }
+
+        // 根据是否启用时间戳选择不同的接收方式
+        if !pgConfig.timestamp.is_empty() {
+            // 时间戳模式：使用特殊的接收函数解析时间戳
+            match receive_icmp_reply_with_timestamp(&socket, pgConfig.identifier, pgConfig) {
+                Ok(reply) => {
+                    let receive_seq = reply.sequence;
+                    if let Some(sent_time) = status.get_sent_time(receive_seq) {
+                        let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0;
+
+                        if pgConfig.audible {
+                            print!("\x07");
+                            let _ = std::io::stdout().flush();
+                        }
+
+                        // 时间戳模式显示
+                        let message = format!(
+                            "{} bytes from {}: icmp_seq={} ttl={} time={:.3} ms",
+                            pgConfig.packet_size + 8,
+                            reply.source_ip,
+                            receive_seq,
+                            reply.ttl,
+                            rtt
+                        );
+                        println!("{}", message);
+
+                        // 显示Record Route信息 (在回复信息后)
+                        if let Some(data) = reply.ip_options {
+                            parse_record_route_option(&data, pgConfig);
+                        }
+
+                        status.update(rtt);
+                    }
+                }
+                Err(e) => {
+                    // 检查是否是ICMP错误（destination unreachable等）
+                    let error_msg = e.to_string();
+                    if error_msg.contains("Destination unreachable")
+                        || error_msg.contains("Time exceeded")
+                        || error_msg.contains("Parameter problem")
+                    {
+                        status.record_error();
+                    } else {
+                        if pgConfig.outstanding {
+                            println!("No reply yet for sequence {}", seq);
+                        }
+                        debug!("Failed to receive ICMP reply with timestamp: {}", e);
+                    }
+                }
+            }
+        } else {
+            // 普通模式 - 尝试接收回复，设置适当的超时时间
+            match receive_icmp_reply_with_timeout(
+                &socket,
+                pgConfig.identifier,
+                Duration::from_millis(1000),
+            ) {
+                Ok(reply) => {
+                    let receive_seq = reply.sequence;
+                    if let Some(sent_time) = status.get_sent_time(receive_seq) {
+                        let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0;
+
+                        if pgConfig.audible {
+                            print!("\x07");
+                            let _ = std::io::stdout().flush();
+                        }
+
+                        print_response_cached_with_ident(
+                            &IpAddr::V4(reply.source_ip),
+                            receive_seq,
+                            rtt,
+                            reply.ttl,
+                            pgConfig,
+                            pgConfig.identifier,
+                        );
+
+                        // 显示Record Route信息 (在回复信息后)
+                        if let Some(data) = reply.ip_options {
+                            parse_record_route_option(&data, pgConfig);
+                        }
+
+                        // 如果是 -c 模式，统一在这里输出换行  必须换行
+                        if pgConfig.count.is_some() {
+                            println!();
+                        }
+
+                        status.update(rtt);
+                    } else {
+                        error!("Failed to find sent time for seq={}", receive_seq);
+                    }
+                }
+                Err(e) => {
+                    // 检查是否是ICMP错误（destination unreachable等）
+                    let error_msg = e.to_string();
+                    if error_msg.contains("Destination unreachable")
+                        || error_msg.contains("Time exceeded")
+                        || error_msg.contains("Parameter problem")
+                    {
+                        status.record_error();
+                    } else {
+                        if pgConfig.outstanding {
+                            println!("No reply yet for sequence {}", seq);
+                        }
+                        debug!("Failed to receive ICMP reply: {}", e);
+                    }
+                }
+            }
+        }
+
+        seq = seq.wrapping_add(1);
+
+        // 动态调整间隔
+        if pgConfig.adaptive {
+            let interval = match smoothed_rtt {
+                Some(avg) => Duration::from_millis((avg * 1.5).max(10.0) as u64),
+                None => Duration::from_millis(100),
+            };
+            std::thread::sleep(interval);
+        } else {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        if timeout_or_count_exit(pgConfig, &status) {
+            break;
+        }
+    }
+
+    // 在主循环结束后，额外监听一段时间收集可能延迟到达的错误消息
+    let final_listen_start = Instant::now();
+    while final_listen_start.elapsed() < Duration::from_millis(500) {
+        if let Ok(reply) = receive_icmp_reply_with_timeout(
+            &socket,
+            pgConfig.identifier,
+            Duration::from_millis(100),
+        ) {
+            if let Some(sent_time) = status.get_sent_time(reply.sequence) {
+                let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0;
+                print_response_cached_with_ident(
+                    &IpAddr::V4(reply.source_ip),
+                    reply.sequence,
+                    rtt,
+                    reply.ttl,
+                    pgConfig,
+                    pgConfig.identifier,
+                );
+                status.update(rtt);
+
+                // 显示Record Route信息
+                if let Some(data) = reply.ip_options {
+                    parse_record_route_option(&data, pgConfig);
+                }
+            }
+        }
+    }
+
+    status.print_summary(&pgConfig.domain);
+    Ok(())
+}
+
+// 获取访问目标的本地IP地址
+fn get_local_ip_for_target(target: Ipv4Addr) -> Result<Ipv4Addr, anyhow::Error> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect(format!("{}:53", target))?;
+    let local_addr = socket.local_addr()?;
+    match local_addr.ip() {
+        std::net::IpAddr::V4(ip) => Ok(ip),
+        _ => Err(anyhow::anyhow!("Expected IPv4 address")),
+    }
+}
+
+// 新增：使用常规socket接收带时间戳的回复
+fn receive_icmp_reply_with_timestamp(
+    socket: &Socket,
+    identifier: u16,
+    config: &PingConfig,
+) -> IcmpReplyResult {
+    debug!("Receiving ICMP reply with timestamp using socket");
+    let mut buffer = [std::mem::MaybeUninit::<u8>::uninit(); PACKET_SIZE];
+
+    loop {
+        match socket.recv_from(&mut buffer) {
+            Ok((size, _addr)) => {
+                debug!("Received packet of size {}", size);
+
+                // 解析 IPv4 头部
+                let ipv4_packet = Ipv4Packet::new(unsafe {
+                    &*(&buffer[..size] as *const [std::mem::MaybeUninit<u8>] as *const [u8])
+                })
+                .ok_or(anyhow::anyhow!("Invalid IPv4 packet"))?;
+
+                let mut timestamp_option_data = None;
+                let rr_option_data = if !ipv4_packet.get_options().is_empty() {
+                    let mut bytes: Vec<u8> = Vec::new();
+                    for opt in ipv4_packet.get_options_iter() {
+                        if opt.get_number() == Ipv4OptionNumbers::TS {
+                            timestamp_option_data = Some(opt.packet().to_vec());
+                        }
+                        bytes.extend_from_slice(opt.packet());
+                    }
+                    Some(bytes)
+                } else {
+                    None
+                };
+
+                // 检查IP选项中的时间戳和Record Route
+                if !ipv4_packet.get_options().is_empty() {
+                    debug!(
+                        "Packet has IP options, length: {}",
+                        ipv4_packet.get_options().len()
+                    );
+                    for option in ipv4_packet.get_options_iter() {
+                        debug!("Option type: {:?}", option.get_number());
+                        if option.get_number() == Ipv4OptionNumbers::TS {
+                            debug!("Found timestamp option in reply");
+                        } else if option.get_number().0 == 7 {
+                            debug!("Found Record Route option");
+                        }
+                    }
+                }
+
+                // 提取 ICMP 负载
+                let icmp_payload = ipv4_packet.payload();
+                let icmp_packet =
+                    IcmpPacket::new(icmp_payload).ok_or(anyhow::anyhow!("Invalid ICMP packet"))?;
+                debug!("Received ICMP packet: {:?}", icmp_packet);
+
+                match icmp_packet.get_icmp_type() {
+                    IcmpTypes::EchoReply => {
+                        let echo_reply = EchoReplyPacket::new(icmp_packet.packet())
+                            .ok_or(anyhow::anyhow!("Invalid Echo Reply packet"))?;
+
+                        if echo_reply.get_identifier() != identifier {
+                            debug!("Mismatched ID. Expected: ID={}", identifier);
+                            continue;
+                        }
+
+                        let src_ip = ipv4_packet.get_source();
+                        let ttl = ipv4_packet.get_ttl();
+
+                        // 如果找到时间戳选项，显示时间戳信息
+                        if let Some(data) = &rr_option_data {
+                            parse_record_route_option(data, config);
+                        }
+
+                        // 返回结果，优先返回Record Route数据
+                        return Ok(IcmpReply {
+                            sequence: echo_reply.get_sequence_number(),
+                            bytes_received: size,
+                            source_ip: src_ip,
+                            ttl,
+                            ip_options: rr_option_data,
+                        });
+                    }
+                    IcmpTypes::DestinationUnreachable => {
+                        return Err(anyhow::anyhow!("Destination unreachable"));
+                    }
+                    IcmpTypes::TimeExceeded => {
+                        return Err(anyhow::anyhow!("Time exceeded"));
+                    }
+                    IcmpTypes::ParameterProblem => {
+                        return Err(anyhow::anyhow!("Parameter problem"));
+                    }
+                    _ => {
+                        debug!(
+                            "Received non-reply ICMP type: {:?}",
+                            icmp_packet.get_icmp_type()
+                        );
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to receive packet: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+}
