@@ -23,6 +23,7 @@ use std::{
 
 use trust_dns_resolver::{proto::rr::RecordType, Resolver};
 
+use crate::ping::ping6_common::ping6_run;
 use crate::{
     iputils_common::{init_logger, initialize_signal_handler, is_running, lookup_and_extend_ips},
     ping::{
@@ -1346,5 +1347,59 @@ fn receive_icmp_reply_with_timestamp(
                 return Err(e.into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ping::ping_types::{parse_hex, parse_u32};
+
+    #[test]
+    fn test_parse_u32_decimal() {
+        assert_eq!(parse_u32("123"), Ok(123));
+        assert_eq!(parse_u32("0"), Ok(0));
+        assert_eq!(parse_u32("4294967295"), Ok(4294967295)); // u32 max
+    }
+
+    #[test]
+    fn test_parse_u32_hex() {
+        assert_eq!(parse_u32("0x1a"), Ok(0x1a));
+        assert_eq!(parse_u32("0XFF"), Ok(0xff));
+        assert_eq!(parse_u32("0xFFFFFFFF"), Ok(0xFFFFFFFF)); // u32 max in hex
+    }
+
+    #[test]
+    fn test_parse_u32_invalid() {
+        assert!(parse_u32("abc").is_err());
+        assert!(parse_u32("0xzz").is_err());
+        assert!(parse_u32("").is_err());
+        assert!(parse_u32("4294967296").is_err()); // u32 overflow
+    }
+
+    #[test]
+    fn test_parse_hex_valid() {
+        assert_eq!(
+            parse_hex("48656c6c6f"),
+            Ok(vec![0x48, 0x65, 0x6c, 0x6c, 0x6f])
+        ); // "Hello"
+        assert_eq!(parse_hex(""), Ok(vec![]));
+        assert_eq!(parse_hex("deadbeef"), Ok(vec![0xde, 0xad, 0xbe, 0xef]));
+    }
+
+    #[test]
+    fn test_parse_hex_invalid() {
+        assert!(parse_hex("zz").is_err());
+        assert!(parse_hex("0x123").is_err()); // hex crate doesn't support 0x prefix
+        assert!(parse_hex("123 ").is_err());
+        assert!(parse_hex("abcg").is_err());
+    }
+
+    #[test]
+    fn test_parse_hex_odd_length() {
+        // 现在支持奇数长度的十六进制字符串（匹配原生ping行为）
+        assert_eq!(parse_hex("a"), Ok(vec![0x0a])); // "a" -> "0a"
+        assert_eq!(parse_hex("123"), Ok(vec![0x12, 0x03])); // "123" -> "1203"
+        assert_eq!(parse_hex("f"), Ok(vec![0x0f])); // "f" -> "0f"
+        assert_eq!(parse_hex("12345"), Ok(vec![0x12, 0x34, 0x05])); // "12345" -> "123405"
     }
 }
