@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+use utiputils::ifenslave;
+
 fn main() {
-    println!("Hello, world!");
+    ifenslave::main();
 }
