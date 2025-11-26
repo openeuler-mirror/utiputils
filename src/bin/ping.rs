@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+use utiputils::ping::ping_impl;
+
 fn main() {
-    println!("Hello, world!");
+    ping_impl::main();
 }
