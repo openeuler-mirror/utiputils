@@ -439,14 +439,12 @@ pub fn print_response(ip: &IpAddr, seq: u16, rtt: f64, ttl: u8, config: &PingCon
                 println!("[{:?}] {}", timestamp as f64 / 1_000_000_000.0, message);
             }
         }
+    } else if config.count.is_some() {
+        print!("{}", message);
+        use std::io::{stdout, Write};
+        stdout().flush().unwrap();
     } else {
-        if config.count.is_some() {
-            print!("{}", message);
-            use std::io::{stdout, Write};
-            stdout().flush().unwrap();
-        } else {
-            println!("{}", message);
-        }
+        println!("{}", message);
     }
 }
 
@@ -554,16 +552,13 @@ pub fn print_response_cached_with_ident(
                 println!("[{:?}] {}", timestamp as f64 / 1_000_000_000.0, message);
             }
         }
+    } else if config.count.is_some() {
+        // -c 模式下，不换行
+        print!("{}", message);
+        use std::io::{stdout, Write};
+        stdout().flush().unwrap();
     } else {
-        if config.count.is_some() {
-            // -c 模式下，不换行
-            print!("{}", message);
-            //println!("{}", message);
-            use std::io::{stdout, Write};
-            stdout().flush().unwrap();
-        } else {
-            println!("{}", message);
-        }
+        println!("{}", message);
     }
 }
 
@@ -752,18 +747,14 @@ pub fn parse_record_route_option(option_data: &[u8], config: &PingConfig) {
                 print!("    (same route)");
             }
             //println!(); // 添加换行，确保下一行输出正确
+        } else if has_nop {
+            println!("NOP\t(same route)");
         } else {
-            if has_nop {
-                println!("NOP\t(same route)");
-            } else {
-                println!(" (same route)");
-            }
+            println!(" (same route)");
         }
         return;
-    } else {
-        if has_nop {
-            println!("NOP");
-        }
+    } else if has_nop {
+        println!("NOP");
     }
 
     // 根据是否是 -c 模式决定是否去重
@@ -787,7 +778,7 @@ pub fn parse_record_route_option(option_data: &[u8], config: &PingConfig) {
 
             // 在Release模式下也能保持路由随机
             use rand::seq::SliceRandom;
-            unique_ips.shuffle(&mut rand::thread_rng());
+            unique_ips.shuffle(&mut rand::rng());
 
             unique_ips
         };
@@ -798,9 +789,7 @@ pub fn parse_record_route_option(option_data: &[u8], config: &PingConfig) {
             } else {
                 print!("\t");
             }
-            if config.numeric_only {
-                print!("{}", ip);
-            } else if config.is_direct_ip_input {
+            if config.numeric_only || config.is_direct_ip_input {
                 print!("{}", ip);
             } else {
                 let ip_str = ip.to_string();
@@ -832,9 +821,7 @@ pub fn parse_record_route_option(option_data: &[u8], config: &PingConfig) {
             } else {
                 print!("\t");
             }
-            if config.numeric_only {
-                print!("{}", ip);
-            } else if config.is_direct_ip_input {
+            if config.numeric_only || config.is_direct_ip_input {
                 print!("{}", ip);
             } else {
                 let ip_str = ip.to_string();

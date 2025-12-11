@@ -20,7 +20,7 @@ use pnet::{
 use std::{
     env,
     net::{IpAddr, Ipv4Addr},
-    process, thread,
+    process,
     time::{Duration, Instant},
 };
 

@@ -124,18 +124,18 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
     if pgConfig.force_ipv6 && !pgConfig.nodeinfo_opt.is_empty() {
         info!("Running IPv6 nodeinfo query");
         // 对于 nodeinfo 查询，直接解析地址而不进行扩展查找
-        // match host.parse::<IpAddr>() {
-        //     Ok(ip) => {
-        //         if let IpAddr::V6(ipv6) = ip {
-        //             return ping6_run(ipv6, pgConfig);
-        //         } else {
-        //             anyhow::bail!("{}: Address family for hostname not supported", host);
-        //         }
-        //     }
-        //     Err(_) => {
-        //         anyhow::bail!("{}: Address family for hostname not supported", host);
-        //     }
-        // }
+        match host.parse::<IpAddr>() {
+            Ok(ip) => {
+                if let IpAddr::V6(ipv6) = ip {
+                    return ping6_run(ipv6, pgConfig);
+                } else {
+                    anyhow::bail!("{}: Address family for hostname not supported", host);
+                }
+            }
+            Err(_) => {
+                anyhow::bail!("{}: Address family for hostname not supported", host);
+            }
+        }
     }
 
     // 普通ping流程：查找并扩展IP地址
@@ -284,38 +284,38 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
     match target_ip {
         IpAddr::V4(ipv4) => {
             info!("Running ping4 for address: {}", ipv4);
-            // if let Err(e) = ping4_run(ipv4, pgConfig) {
-            //     // 检查是否是权限错误
-            //     let error_msg = e.to_string();
-            //     if error_msg.contains("Permission denied")
-            //         || error_msg.contains("Operation not permitted")
-            //         || error_msg.contains("Failed to create socket")
-            //     {
-            //         eprintln!("utping: socket: Operation not permitted");
-            //         std::process::exit(1);
-            //     } else {
-            //         eprintln!("utping: {}", e);
-            //         std::process::exit(1);
-            //     }
-            // }
+            if let Err(e) = ping4_run(ipv4, pgConfig) {
+                // 检查是否是权限错误
+                let error_msg = e.to_string();
+                if error_msg.contains("Permission denied")
+                    || error_msg.contains("Operation not permitted")
+                    || error_msg.contains("Failed to create socket")
+                {
+                    eprintln!("utping: socket: Operation not permitted");
+                    std::process::exit(1);
+                } else {
+                    eprintln!("utping: {}", e);
+                    std::process::exit(1);
+                }
+            }
             info!("Ping4 run completed");
         }
         IpAddr::V6(ipv6) => {
             info!("Running ping6 for address: {}", ipv6);
-            // if let Err(e) = ping6_run(ipv6, pgConfig) {
-            //     // 检查是否是权限错误
-            //     let error_msg = e.to_string();
-            //     if error_msg.contains("Permission denied")
-            //         || error_msg.contains("Operation not permitted")
-            //         || error_msg.contains("Failed to create socket")
-            //     {
-            //         eprintln!("utping: socket: Operation not permitted");
-            //         std::process::exit(1);
-            //     } else {
-            //         eprintln!("utping: {}", e);
-            //         std::process::exit(1);
-            //     }
-            // }
+            if let Err(e) = ping6_run(ipv6, pgConfig) {
+                // 检查是否是权限错误
+                let error_msg = e.to_string();
+                if error_msg.contains("Permission denied")
+                    || error_msg.contains("Operation not permitted")
+                    || error_msg.contains("Failed to create socket")
+                {
+                    eprintln!("utping: socket: Operation not permitted");
+                    std::process::exit(1);
+                } else {
+                    eprintln!("utping: {}", e);
+                    std::process::exit(1);
+                }
+            }
             info!("Ping6 run completed");
         }
     }

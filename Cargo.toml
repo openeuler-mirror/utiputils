@@ -1,5 +1,6 @@
 [package]
 name = "utiputils"
+version = "1.0.0"
 edition = "2021"
 autobins = false
 license = "GPL-2.0-or-later"

@@ -20,7 +20,7 @@ pub fn main() {
 
     // Handle version information
     if opt_args.verbose || opt_args.version {
-        println!("utifenslave:v1.1.0 (Mar 17, 2025)");
+        println!("utifenslave:v1.0.0 (Mar 17, 2025)");
         println!("o Donald Becker (becker@cesdis.gsfc.nasa.gov).");
         println!("o Detach support added on 2000/10/02 by Willy Tarreau (willy at meta-x.org).");
         println!(
