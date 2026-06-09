@@ -121,32 +121,14 @@ pub fn reverse_dns_lookup(ip: &str) -> Result<String, anyhow::Error> {
         }
     };
 
-    // 调用 getnameinfo
-    let mut host_buf = [0u8; 1024];
-    let mut service_buf = [0u8; 1024];
-    let result = unsafe {
-        libc::getnameinfo(
-            sockaddr_ptr,
-            sockaddr_len,
-            host_buf.as_mut_ptr() as *mut libc::c_char,
-            host_buf.len() as libc::socklen_t,
-            service_buf.as_mut_ptr() as *mut libc::c_char,
-            service_buf.len() as libc::socklen_t,
-            libc::NI_NAMEREQD,
-        )
-    };
-
-    if result != 0 {
-        debug!("getnameinfo failed: {}", result);
-        return Ok(ip.to_string());
-    }
-
-    // 提取主机名
-    let host = unsafe {
-        std::ffi::CStr::from_ptr(host_buf.as_ptr() as *const libc::c_char)
-            .to_string_lossy()
-            .into_owned()
-    };
+    let host =
+        match utiputils_sys::dns::getnameinfo_host(sockaddr_ptr, sockaddr_len, libc::NI_NAMEREQD) {
+            Ok(host) => host,
+            Err(code) => {
+                debug!("getnameinfo failed: {}", code);
+                return Ok(ip.to_string());
+            }
+        };
     debug!("reverse DNS lookup: {} -> {}", ip, host);
     Ok(host)
 }
