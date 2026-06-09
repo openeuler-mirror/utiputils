@@ -34,7 +34,7 @@ mod tests {
         let mut config = PingConfig::new_for_test();
         config.pattern = vec![0xAB, 0xCD];
         let request = IcmpEchoRequest::new(1, 1234, 8);
-        let packet = request.build_packet_V6(&config);
+        let packet = request.build_packet_v6(&config);
         assert_eq!(packet.len(), 16); // 8 header + 8 payload
     }
 
