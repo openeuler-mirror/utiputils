@@ -28,20 +28,6 @@ use nix::sys::socket::SockType;
 
 use crate::iputils_common::reverse_dns_lookup;
 
-const DEFDATALEN: usize = 64 - 8;
-const MAXWAIT: u64 = 10;
-const MININTERVAL: u64 = 10;
-const MINUSERINTERVAL: u64 = 2;
-const IDENTIFIER_MAX: u16 = 0xFFFF;
-const MAX_DUP_CHK: usize = 0x10000;
-const BITMAP_SHIFT: usize = if cfg!(target_pointer_width = "64") {
-    6
-} else {
-    5
-};
-
-type Bitmap = u64;
-
 pub fn parse_u32(s: &str) -> Result<u32, String> {
     if let Some(hex_str) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u32::from_str_radix(hex_str, 16).map_err(|e| e.to_string())
@@ -496,20 +482,20 @@ impl PingConfig {
         self.last_rr_raw.borrow_mut().clear();
     }
 
-    pub fn initStartTime(&mut self) {
+    pub fn init_start_time(&mut self) {
         self.starttime = Some(Instant::now());
     }
 
-    pub fn getStartTime(&self) -> Instant {
+    pub fn get_start_time(&self) -> Instant {
         self.starttime.unwrap()
     }
 
-    pub fn setInterfaceInfo(&mut self, ip: String, interface_name: String) {
+    pub fn set_interface_info(&mut self, ip: String, interface_name: String) {
         self.local_ip = ip;
         self.interface_name = interface_name;
     }
 
-    pub fn getInterfaceInfo(&self) -> (String, String) {
+    pub fn get_interface_info(&self) -> (String, String) {
         (self.local_ip.clone(), self.interface_name.clone())
     }
 
