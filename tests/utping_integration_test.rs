@@ -4,13 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#![allow(clippy::new_without_default)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-
 use std::process::Command;
-
-// 引入测试工具模块
-mod test_utils;
 
 /// 用于集成测试的辅助结构
 pub struct UtpingTester {
@@ -59,10 +53,16 @@ impl UtpingTester {
     /// 检查sudo是否可用
     pub fn check_sudo_available(&self) -> bool {
         Command::new("sudo")
-            .args(&["-n", "true"])
+            .args(["-n", "true"])
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
+    }
+}
+
+impl Default for UtpingTester {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -692,7 +692,7 @@ fn test_pattern_packet_verification() {
 
     // 检查tcpdump是否可用
     if !Command::new("tcpdump")
-        .args(&["--version"])
+        .args(["--version"])
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
