@@ -4,12 +4,10 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#![allow(unused_variables)]
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use pnet::packet::{
     icmp::{echo_reply::EchoReplyPacket, IcmpPacket, IcmpTypes},
-    ip::IpNextHeaderProtocols,
     ipv4::{Ipv4OptionNumbers, Ipv4Packet},
     Packet,
 };
@@ -51,31 +49,6 @@ pub struct IcmpReply {
 // 为复杂的返回类型定义类型别名
 type IcmpReplyResult = Result<IcmpReply, anyhow::Error>;
 
-fn nodeinfo_optUsage() -> String {
-    let help_text = [
-        "ping -6 -N <nodeinfo opt>",
-        "Help:",
-        "  help",
-        "Query:",
-        "  name",
-        "  ipv6",
-        "  ipv6-all",
-        "  ipv6-compatible",
-        "  ipv6-global",
-        "  ipv6-linklocal",
-        "  ipv6-sitelocal",
-        "  ipv4",
-        "  ipv4-all",
-        "Subject:",
-        "  subject-ipv6=addr",
-        "  subject-ipv4=addr",
-        "  subject-name=name",
-        "  subject-fqdn=name",
-    ];
-
-    help_text.join("\n")
-}
-
 pub fn main() {
     // 初始化日志记录器
     init_logger();
@@ -88,7 +61,7 @@ pub fn main() {
     debug!("Config: {:?}", pgconfig);
 
     initialize_signal_handler();
-    pgconfig.initStartTime();
+    pgconfig.init_start_time();
 
     if let Err(err) = main_ping(&mut pgconfig) {
         eprintln!("ping: {}", err);
@@ -97,37 +70,27 @@ pub fn main() {
     }
 }
 
-fn parseflow(str: &str) -> Result<u32, anyhow::Error> {
-    let val = if str.starts_with("0x") || str.starts_with("0X") {
-        u32::from_str_radix(&str[2..], 16)?
-    } else {
-        str.parse::<u32>()?
-    };
-
-    Ok(val)
-}
-
-fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
+fn main_ping(pg_config: &mut PingConfig) -> Result<(), anyhow::Error> {
     let mut ips: Vec<IpAddr> = Vec::new();
 
     // Verbose output for socket information (before DNS resolution)
-    if pgConfig.verbose {
+    if pg_config.verbose {
         // 原生 ping 显示两个 socket fd，我们简化为显示协议族信息
         println!("ping: sock4.fd: 3 (socktype: SOCK_RAW), sock6.fd: 4 (socktype: SOCK_RAW), hints.ai_family: AF_UNSPEC");
         println!();
     }
 
     // 解析目标地址
-    let host = pgConfig.host.as_ref().unwrap(); // 在这里已经验证过 host 不为 None
+    let host = pg_config.host.as_ref().unwrap(); // 在这里已经验证过 host 不为 None
 
     // 如果启用 IPv6 且是 nodeinfo 查询，使用特殊处理
-    if pgConfig.force_ipv6 && !pgConfig.nodeinfo_opt.is_empty() {
+    if pg_config.force_ipv6 && !pg_config.nodeinfo_opt.is_empty() {
         info!("Running IPv6 nodeinfo query");
         // 对于 nodeinfo 查询，直接解析地址而不进行扩展查找
         match host.parse::<IpAddr>() {
             Ok(ip) => {
                 if let IpAddr::V6(ipv6) = ip {
-                    return ping6_run(ipv6, pgConfig);
+                    return ping6_run(ipv6, pg_config);
                 } else {
                     anyhow::bail!("{}: Address family for hostname not supported", host);
                 }
@@ -143,11 +106,11 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
         Ok(ip) => {
             // 输入是IP地址
             info!("Target is an IP address: {}", ip);
-            pgConfig.is_direct_ip_input = true;
+            pg_config.is_direct_ip_input = true;
             ips.push(ip);
 
             // Verbose output for IP address
-            if pgConfig.verbose {
+            if pg_config.verbose {
                 let family = if ip.is_ipv4() { "AF_INET" } else { "AF_INET6" };
                 println!("ai->ai_family: {}, ai->ai_canonname: '{}'", family, host);
             }
@@ -155,7 +118,7 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
         Err(_) => {
             // 输入是域名，需要DNS解析
             info!("Target is a domain name: {}", host);
-            pgConfig.is_direct_ip_input = false;
+            pg_config.is_direct_ip_input = false;
             let resolver = Resolver::from_system_conf().context("Failed to create resolver")?;
 
             // 先查询 CNAME 记录获取 canonical name
@@ -167,14 +130,14 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
                 .unwrap_or_else(|| host.to_string());
 
             // 更新配置中的域名为canonical name
-            pgConfig.domain = canonical_name.clone();
+            pg_config.domain = canonical_name.clone();
 
             // 根据强制选项确定查询类型
-            match (pgConfig.force_ipv4, pgConfig.force_ipv6) {
+            match (pg_config.force_ipv4, pg_config.force_ipv6) {
                 (true, _) => {
                     // 只查询IPv4
                     lookup_and_extend_ips(&resolver, host, RecordType::A, &mut ips)?;
-                    if pgConfig.verbose && !ips.is_empty() {
+                    if pg_config.verbose && !ips.is_empty() {
                         println!(
                             "ai->ai_family: AF_INET, ai->ai_canonname: '{}'",
                             canonical_name
@@ -184,7 +147,7 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
                 (_, true) => {
                     // 只查询IPv6
                     lookup_and_extend_ips(&resolver, host, RecordType::AAAA, &mut ips)?;
-                    if pgConfig.verbose && !ips.is_empty() {
+                    if pg_config.verbose && !ips.is_empty() {
                         println!(
                             "ai->ai_family: AF_INET6, ai->ai_canonname: '{}'",
                             canonical_name
@@ -239,15 +202,15 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
     }
 
     // 根据强制选项过滤IP
-    let filtered_ips: Vec<IpAddr> = if pgConfig.force_ipv4 {
+    let filtered_ips: Vec<IpAddr> = if pg_config.force_ipv4 {
         ips.into_iter().filter(|ip| ip.is_ipv4()).collect()
-    } else if pgConfig.force_ipv6 {
+    } else if pg_config.force_ipv6 {
         ips.into_iter().filter(|ip| ip.is_ipv6()).collect()
     } else {
         ips
     };
 
-    if filtered_ips.is_empty() && (pgConfig.force_ipv4 || pgConfig.force_ipv6) {
+    if filtered_ips.is_empty() && (pg_config.force_ipv4 || pg_config.force_ipv6) {
         anyhow::bail!("{}: Address family for hostname not supported", host);
     }
 
@@ -255,10 +218,10 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
     let target_ip = filtered_ips[0];
 
     // 如果是域名解析且没有强制指定地址族，现在显示实际使用的地址族信息
-    if pgConfig.verbose
+    if pg_config.verbose
         && host.parse::<IpAddr>().is_err()
-        && !pgConfig.force_ipv4
-        && !pgConfig.force_ipv6
+        && !pg_config.force_ipv4
+        && !pg_config.force_ipv6
     {
         // 先查询 CNAME 记录获取 canonical name
         if let Ok(resolver) = Resolver::from_system_conf() {
@@ -284,7 +247,7 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
     match target_ip {
         IpAddr::V4(ipv4) => {
             info!("Running ping4 for address: {}", ipv4);
-            if let Err(e) = ping4_run(ipv4, pgConfig) {
+            if let Err(e) = ping4_run(ipv4, pg_config) {
                 // 检查是否是权限错误
                 let error_msg = e.to_string();
                 if error_msg.contains("Permission denied")
@@ -302,7 +265,7 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
         }
         IpAddr::V6(ipv6) => {
             info!("Running ping6 for address: {}", ipv6);
-            if let Err(e) = ping6_run(ipv6, pgConfig) {
+            if let Err(e) = ping6_run(ipv6, pg_config) {
                 // 检查是否是权限错误
                 let error_msg = e.to_string();
                 if error_msg.contains("Permission denied")
@@ -323,7 +286,7 @@ fn main_ping(pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-pub fn create_icmpv4_socket(pgConfig: &mut PingConfig) -> Result<socket2::Socket, anyhow::Error> {
+pub fn create_icmpv4_socket(pg_config: &mut PingConfig) -> Result<socket2::Socket, anyhow::Error> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::RAW,
@@ -334,27 +297,27 @@ pub fn create_icmpv4_socket(pgConfig: &mut PingConfig) -> Result<socket2::Socket
     // Verbose output for socket information will be shown later
 
     // 设置 TTL
-    socket.set_ttl(pgConfig.ttl).context("Failed to set TTL")?;
+    socket.set_ttl(pg_config.ttl).context("Failed to set TTL")?;
 
-    if pgConfig.send_buffer_size > 0 {
-        debug!("Setting send buffer size to {}", pgConfig.send_buffer_size);
+    if pg_config.send_buffer_size > 0 {
+        debug!("Setting send buffer size to {}", pg_config.send_buffer_size);
         socket
-            .set_send_buffer_size(pgConfig.send_buffer_size)
+            .set_send_buffer_size(pg_config.send_buffer_size)
             .context("Failed to set send buffer size")?;
     }
 
     // 设置了 interface 参数
-    if !pgConfig.interface.is_empty() {
-        debug!("Binding to interface: {}", pgConfig.interface);
-        let (ip_addr, interface_name) = bind_to_interface_or_ip(&socket, &pgConfig.interface)
+    if !pg_config.interface.is_empty() {
+        debug!("Binding to interface: {}", pg_config.interface);
+        let (ip_addr, interface_name) = bind_to_interface_or_ip(&socket, &pg_config.interface)
             .context("Failed to bind to interface")?;
-        pgConfig.setInterfaceInfo(ip_addr.to_string(), interface_name);
+        pg_config.set_interface_info(ip_addr.to_string(), interface_name);
     }
 
     // 严格源地址
-    if !pgConfig.strictsource.is_empty() {
+    if !pg_config.strictsource.is_empty() {
         debug!("Setting strict source");
-        let strictsource_ip = pgConfig
+        let strictsource_ip = pg_config
             .strictsource
             .parse::<Ipv4Addr>()
             .context("Invalid IPv4 address")?;
@@ -363,18 +326,18 @@ pub fn create_icmpv4_socket(pgConfig: &mut PingConfig) -> Result<socket2::Socket
         socket
             .bind(&source_sockaddr)
             .context("Failed to bind to strict source")?;
-        pgConfig.setInterfaceInfo(strictsource_ip.to_string(), "".to_string());
+        pg_config.set_interface_info(strictsource_ip.to_string(), "".to_string());
     }
 
     // 设置 mark 参数
-    if let Some(mark) = pgConfig.mark {
+    if let Some(mark) = pg_config.mark {
         if mark > 0 {
             info!("Setting mark");
             socket.set_mark(mark).context("Failed to set mark")?;
         }
     }
 
-    if let Some(tclass) = pgConfig.tclass {
+    if let Some(tclass) = pg_config.tclass {
         if tclass > 0 {
             info!("Setting tclass");
             socket.set_tos(tclass).context("Failed to set tclass")?;
@@ -382,7 +345,7 @@ pub fn create_icmpv4_socket(pgConfig: &mut PingConfig) -> Result<socket2::Socket
     }
 
     // 禁用回环
-    if pgConfig.loop_multicast_back {
+    if pg_config.loop_multicast_back {
         socket
             .set_multicast_loop_v4(false)
             .context("Failed to disable multicast loop")?;
@@ -390,10 +353,10 @@ pub fn create_icmpv4_socket(pgConfig: &mut PingConfig) -> Result<socket2::Socket
 
     // 设置超时
     socket
-        .set_read_timeout(Some(pgConfig.timeout))
+        .set_read_timeout(Some(pg_config.timeout))
         .context("Failed to set timeout")?;
 
-    if pgConfig.flood {
+    if pg_config.flood {
         debug!("Setting flood");
         // 不设置非阻塞模式，而是在接收时使用短超时
         // socket.set_nonblocking(true)?;
@@ -406,23 +369,23 @@ pub fn create_icmpv4_socket(pgConfig: &mut PingConfig) -> Result<socket2::Socket
     // }
 
     // 启用广播（如果需要）
-    if pgConfig.broadcast {
+    if pg_config.broadcast {
         socket
             .set_broadcast(true)
             .context("Failed to enable broadcast")?;
     }
 
     // 设置调试模式
-    if pgConfig.debug {
+    if pg_config.debug {
         info!("Enabling debug mode");
         set_socket_option(&socket, libc::SOL_SOCKET, libc::SO_DEBUG, 1)
             .context("Failed to enable debug mode")?;
     }
 
     // 设置 PMTU 发现
-    if !pgConfig.pmtudisc.is_empty() {
+    if !pg_config.pmtudisc.is_empty() {
         info!("Setting PMTU discovery");
-        let optval = match pgConfig.pmtudisc.as_str() {
+        let optval = match pg_config.pmtudisc.as_str() {
             "do" => libc::IP_PMTUDISC_DO,
             "dont" => libc::IP_PMTUDISC_DONT,
             "want" => libc::IP_PMTUDISC_WANT,
@@ -434,15 +397,15 @@ pub fn create_icmpv4_socket(pgConfig: &mut PingConfig) -> Result<socket2::Socket
     }
 
     // 设置记录路由
-    if pgConfig.record_route {
+    if pg_config.record_route {
         info!("Setting record route");
         set_record_route_option(&socket, false).context("Failed to set record route")?;
     }
 
     // 设置时间戳
-    if !pgConfig.timestamp.is_empty() {
+    if !pg_config.timestamp.is_empty() {
         info!("Setting timestamp");
-        set_timestamp_option(&socket, &pgConfig.timestamp)?;
+        set_timestamp_option(&socket, &pg_config.timestamp)?;
     }
 
     Ok(socket)
@@ -585,70 +548,43 @@ fn receive_icmp_reply(socket: &Socket, identifier: u16) -> IcmpReplyResult {
     }
 }
 
-// 接收带时间戳选项的IP包回复
-fn receive_ip_reply_with_timestamp(
-    rx: &mut pnet::transport::TransportReceiver,
-    identifier: u16,
-    _config: &PingConfig,
-) -> Result<IcmpReply, anyhow::Error> {
-    debug!("Receiving IP reply with timestamp");
-
-    let mut iter = pnet::transport::ipv4_packet_iter(rx);
-    let timeout = Duration::from_secs(1);
-
-    match iter.next_with_timeout(timeout) {
-        Ok(Some((packet, addr))) => {
-            debug!(
-                "Received IP packet from {}: len={}",
-                addr,
-                packet.packet().len()
-            );
-
-            let mut timestamp_option_data = None;
-
-            // 检查是否有时间戳选项
-            if !packet.get_options().is_empty() {
-                debug!("Packet has IP options");
-                for option in packet.get_options_iter() {
-                    if option.get_number() == Ipv4OptionNumbers::TS {
-                        debug!("Found timestamp option in reply");
-                        timestamp_option_data = Some(option.packet().to_vec());
-                    }
-                }
-            }
-
-            // 处理ICMP内容
-            if packet.get_next_level_protocol() == IpNextHeaderProtocols::Icmp {
-                let icmp_packet = IcmpPacket::new(packet.payload())
-                    .ok_or(anyhow::anyhow!("Invalid ICMP packet"))?;
-
-                if icmp_packet.get_icmp_type() == IcmpTypes::EchoReply {
-                    let echo_reply = EchoReplyPacket::new(icmp_packet.packet())
-                        .ok_or(anyhow::anyhow!("Invalid Echo Reply packet"))?;
-
-                    if echo_reply.get_identifier() == identifier {
-                        let src_ip = if let IpAddr::V4(ipv4) = addr {
-                            ipv4
-                        } else {
-                            return Err(anyhow::anyhow!("Expected IPv4 address"));
-                        };
-
-                        return Ok(IcmpReply {
-                            sequence: echo_reply.get_sequence_number(),
-                            bytes_received: icmp_packet.packet().len(), // 使用ICMP包大小，不是IP包大小
-                            source_ip: src_ip,
-                            ttl: packet.get_ttl(),
-                            ip_options: timestamp_option_data,
-                        });
-                    }
-                }
-            }
-
-            Err(anyhow::anyhow!("No matching echo reply found"))
-        }
-        Ok(None) => Err(anyhow::anyhow!("Timeout waiting for reply")),
-        Err(e) => Err(anyhow::anyhow!("Error receiving packet: {}", e)),
+fn extract_ipv4_option(option_data: &[u8], option_type: u8) -> Option<Vec<u8>> {
+    if option_data.is_empty() {
+        return None;
     }
+
+    let mut pos = 0;
+    while pos < option_data.len() {
+        let ty = option_data[pos];
+
+        // End of Option List
+        if ty == 0 {
+            break;
+        }
+
+        // NOP
+        if ty == 1 {
+            pos += 1;
+            continue;
+        }
+
+        if pos + 1 >= option_data.len() {
+            break;
+        }
+
+        let len = option_data[pos + 1] as usize;
+        if len < 2 || pos + len > option_data.len() {
+            break;
+        }
+
+        if ty == option_type {
+            return Some(option_data[pos..pos + len].to_vec());
+        }
+
+        pos += len;
+    }
+
+    None
 }
 
 // 解析和显示时间戳信息 - 修正时间戳计算逻辑
@@ -670,146 +606,89 @@ fn print_timestamp_info(option_data: &[u8], _config: &PingConfig) {
         option_data.len()
     );
 
-    let timestamp_data = &option_data[4..];
+    let effective_len = length.min(option_data.len());
+    if effective_len < 4 {
+        return;
+    }
+    let timestamp_data = &option_data[4..effective_len];
 
     if flag == 0 {
         // tsonly 模式：仅时间戳
-        if timestamp_data.len() >= 4 {
-            // 解析第一个时间戳
-            let first_timestamp = u32::from_be_bytes([
-                timestamp_data[0],
-                timestamp_data[1],
-                timestamp_data[2],
-                timestamp_data[3],
-            ]);
+        let max_timestamps = timestamp_data.len() / 4;
+        let pointer_clamped = pointer.min(length.saturating_add(1));
+        let filled = pointer_clamped.saturating_sub(5) / 4;
+        let filled = filled.min(max_timestamps);
 
-            // 显示时间戳信息，使用英文以匹配原生ping
-            println!("TS:     {} absolute", first_timestamp);
+        debug!(
+            "tsonly: max_timestamps={}, pointer={}, filled={}",
+            max_timestamps, pointer, filled
+        );
 
-            // 收集所有有效的时间戳
-            let mut timestamps = vec![first_timestamp];
+        if filled == 0 {
+            return;
+        }
 
-            // 计算最大可能的时间戳数量（基于选项长度）
-            let max_timestamps = (length - 4) / 4; // 减去头部4字节，除以每个时间戳4字节
-            debug!("Max possible timestamps: {}", max_timestamps);
+        let read_ts = |i: usize| -> u32 {
+            let off = i * 4;
+            u32::from_be_bytes([
+                timestamp_data[off],
+                timestamp_data[off + 1],
+                timestamp_data[off + 2],
+                timestamp_data[off + 3],
+            ])
+        };
 
-            // 尝试解析更多时间戳，目标是获得4个时间戳以匹配原生ping
-            for i in 1..max_timestamps.min(9) {
-                // 最多解析9个时间戳
-                let offset = i * 4;
-                if offset + 3 < timestamp_data.len() {
-                    let ts = u32::from_be_bytes([
-                        timestamp_data[offset],
-                        timestamp_data[offset + 1],
-                        timestamp_data[offset + 2],
-                        timestamp_data[offset + 3],
-                    ]);
+        let first_timestamp = read_ts(0);
+        println!("TS:     {} absolute", first_timestamp);
 
-                    timestamps.push(ts);
-                    debug!("Timestamp {}: {}", i + 1, ts);
-
-                    // 如果我们已经有4个时间戳且找到合理的停止点，就停止
-                    if timestamps.len() >= 4 {
-                        // 检查后续时间戳是否都是0，如果是则可以停止
-                        let mut all_zero_after = true;
-                        for j in i + 1..max_timestamps.min(9) {
-                            let next_offset = j * 4;
-                            if next_offset + 3 < timestamp_data.len() {
-                                let next_ts = u32::from_be_bytes([
-                                    timestamp_data[next_offset],
-                                    timestamp_data[next_offset + 1],
-                                    timestamp_data[next_offset + 2],
-                                    timestamp_data[next_offset + 3],
-                                ]);
-                                if next_ts != 0 {
-                                    all_zero_after = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if all_zero_after {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            debug!("Found {} timestamps", timestamps.len());
-
-            // 显示时间戳的相对差值
-            for i in 1..timestamps.len() {
-                let diff = timestamps[i] as i64 - timestamps[i - 1] as i64;
-
-                // 检测异常大的差值，可能表明时间戳未被正确填充
-                if diff.abs() > 1000000 {
-                    // 如果差值超过1000秒，可能是异常值
-                    debug!("Detected abnormal timestamp diff: {}, stopping", diff);
-                    break;
-                }
-
-                println!("        {}", diff);
-            }
+        let mut prev = first_timestamp as i64;
+        for i in 1..filled {
+            let curr = read_ts(i) as i64;
+            println!("        {}", curr - prev);
+            prev = curr;
         }
     } else if flag == 1 {
         // tsandaddr 模式：时间戳和地址交替
-        if timestamp_data.len() >= 8 {
-            // 至少需要一个地址(4字节) + 时间戳(4字节)
+        let max_pairs = timestamp_data.len() / 8;
+        let pointer_clamped = pointer.min(length.saturating_add(1));
+        let filled_pairs = pointer_clamped.saturating_sub(5) / 8;
+        let filled_pairs = filled_pairs.min(max_pairs);
 
-            // 解析第一对：地址 + 时间戳
-            let first_addr = Ipv4Addr::new(
-                timestamp_data[0],
-                timestamp_data[1],
-                timestamp_data[2],
-                timestamp_data[3],
+        debug!(
+            "tsandaddr: max_pairs={}, pointer={}, filled_pairs={}",
+            max_pairs, pointer, filled_pairs
+        );
+
+        if filled_pairs == 0 {
+            return;
+        }
+
+        let read_pair = |i: usize| -> (Ipv4Addr, u32) {
+            let off = i * 8;
+            let addr = Ipv4Addr::new(
+                timestamp_data[off],
+                timestamp_data[off + 1],
+                timestamp_data[off + 2],
+                timestamp_data[off + 3],
             );
-            let first_timestamp = u32::from_be_bytes([
-                timestamp_data[4],
-                timestamp_data[5],
-                timestamp_data[6],
-                timestamp_data[7],
+            let ts = u32::from_be_bytes([
+                timestamp_data[off + 4],
+                timestamp_data[off + 5],
+                timestamp_data[off + 6],
+                timestamp_data[off + 7],
             ]);
+            (addr, ts)
+        };
 
-            // 显示第一行：地址 + 时间戳 + absolute
-            println!("TS:     {}     {} absolute", first_addr, first_timestamp);
+        let (first_addr, first_timestamp) = read_pair(0);
+        println!("TS:     {}     {} absolute", first_addr, first_timestamp);
 
-            // 收集所有地址和时间戳对
-            let mut timestamps = vec![first_timestamp];
-            let max_pairs = (length - 4) / 8; // 每对占用8字节
-            debug!("Max possible address-timestamp pairs: {}", max_pairs);
-
-            // 解析后续的地址-时间戳对
-            for i in 1..max_pairs.min(9) {
-                let offset = i * 8;
-                if offset + 7 < timestamp_data.len() {
-                    let addr = Ipv4Addr::new(
-                        timestamp_data[offset],
-                        timestamp_data[offset + 1],
-                        timestamp_data[offset + 2],
-                        timestamp_data[offset + 3],
-                    );
-                    let ts = u32::from_be_bytes([
-                        timestamp_data[offset + 4],
-                        timestamp_data[offset + 5],
-                        timestamp_data[offset + 6],
-                        timestamp_data[offset + 7],
-                    ]);
-
-                    timestamps.push(ts);
-                    debug!("Address-Timestamp pair {}: {} - {}", i + 1, addr, ts);
-
-                    // 计算与前一个时间戳的差值
-                    let diff = ts as i64 - timestamps[timestamps.len() - 2] as i64;
-
-                    // 检测异常差值
-                    if diff.abs() > 1000000 {
-                        debug!("Detected abnormal timestamp diff: {}, stopping", diff);
-                        break;
-                    }
-
-                    // 显示：地址 + 差值
-                    println!("        {}     {}", addr, diff);
-                }
-            }
+        let mut prev = first_timestamp as i64;
+        for i in 1..filled_pairs {
+            let (addr, ts) = read_pair(i);
+            let curr = ts as i64;
+            println!("        {}     {}", addr, curr - prev);
+            prev = curr;
         }
     } else {
         debug!("Unsupported timestamp flag: {}", flag);
@@ -819,17 +698,17 @@ fn print_timestamp_info(option_data: &[u8], _config: &PingConfig) {
 fn send_icmp_requests(
     socket: &Socket,
     target: Ipv4Addr,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
     seq: u16,
     status: &mut PingStats,
 ) -> Result<(), anyhow::Error> {
     let mut start_seq = seq;
-    for _ in 0..pgConfig.preload {
-        let request = IcmpEchoRequest::new(start_seq, pgConfig.identifier, pgConfig.packet_size);
-        let packet = request.build_packet(pgConfig);
+    for _ in 0..pg_config.preload {
+        let request = IcmpEchoRequest::new(start_seq, pg_config.identifier, pg_config.packet_size);
+        let packet = request.build_packet(pg_config);
 
         // 重新设置 RR 选项，确保每个包的指针都从 4 开始
-        if pgConfig.record_route {
+        if pg_config.record_route {
             // 忽略可能的错误，因为部分系统内核可能不支持重复设置
             let _ = set_record_route_option(socket, false);
         }
@@ -847,11 +726,11 @@ fn send_icmp_requests(
 fn receive_icmp_replies(
     socket: &Socket,
     identifier: u16,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
     status: &mut PingStats,
 ) -> Result<(), anyhow::Error> {
     debug!("Receiving ICMP replies: {:?}", status.sent_times);
-    for _ in 0..pgConfig.preload {
+    for _ in 0..pg_config.preload {
         if !is_running() {
             break;
         }
@@ -863,7 +742,7 @@ fn receive_icmp_replies(
                     print!(".");
                     let _ = std::io::stdout().flush();
 
-                    if pgConfig.audible {
+                    if pg_config.audible {
                         print!("\x07");
                         let _ = std::io::stdout().flush();
                     }
@@ -872,7 +751,7 @@ fn receive_icmp_replies(
 
                     // 显示Record Route信息
                     if let Some(data) = reply.ip_options {
-                        parse_record_route_option(&data, pgConfig);
+                        parse_record_route_option(&data, pg_config);
                     }
 
                     status.update(rtt);
@@ -898,7 +777,7 @@ fn receive_icmp_replies(
             }
         }
 
-        if timeout_or_count_exit(pgConfig, status) {
+        if timeout_or_count_exit(pg_config, status) {
             break;
         }
     }
@@ -908,18 +787,18 @@ fn receive_icmp_replies(
 fn preload_send_and_receive(
     socket: &Socket,
     target: Ipv4Addr,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
     status: &mut PingStats,
 ) -> Result<(), anyhow::Error> {
-    send_icmp_requests(socket, target, pgConfig, 1, status)?;
-    receive_icmp_replies(socket, pgConfig.identifier, pgConfig, status)?;
+    send_icmp_requests(socket, target, pg_config, 1, status)?;
+    receive_icmp_replies(socket, pg_config.identifier, pg_config, status)?;
     Ok(())
 }
 
 fn flood_ping(
     socket: &Socket,
     target: Ipv4Addr,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
     status: &mut PingStats,
 ) -> Result<(), anyhow::Error> {
     let mut start_seq = 1;
@@ -928,11 +807,11 @@ fn flood_ping(
             info!("exit flood mode");
             break;
         }
-        let request = IcmpEchoRequest::new(start_seq, pgConfig.identifier, pgConfig.packet_size);
-        let packet = request.build_packet(pgConfig);
+        let request = IcmpEchoRequest::new(start_seq, pg_config.identifier, pg_config.packet_size);
+        let packet = request.build_packet(pg_config);
 
         // 重新设置 RR 选项，确保每个包的指针都从 4 开始
-        if pgConfig.record_route {
+        if pg_config.record_route {
             // 忽略可能的错误，因为部分系统内核可能不支持重复设置
             let _ = set_record_route_option(socket, false);
         }
@@ -950,7 +829,7 @@ fn flood_ping(
         // 洪水模式使用短超时接收，避免阻塞太久
         match receive_icmp_reply_with_timeout(
             socket,
-            pgConfig.identifier,
+            pg_config.identifier,
             Duration::from_millis(10),
         ) {
             Ok(reply) => {
@@ -966,7 +845,7 @@ fn flood_ping(
 
                     // 显示Record Route信息
                     if let Some(data) = reply.ip_options {
-                        parse_record_route_option(&data, pgConfig);
+                        parse_record_route_option(&data, pg_config);
                     }
                 } else {
                     error!("Failed to find sent time for seq={}", receive_seq);
@@ -990,7 +869,7 @@ fn flood_ping(
         start_seq = start_seq.wrapping_add(1);
         thread::sleep(Duration::from_millis(25));
 
-        if timeout_or_count_exit(pgConfig, status) {
+        if timeout_or_count_exit(pg_config, status) {
             break;
         }
     }
@@ -998,24 +877,24 @@ fn flood_ping(
     Ok(())
 }
 
-fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
+fn ping4_run(target: Ipv4Addr, pg_config: &mut PingConfig) -> Result<(), anyhow::Error> {
     info!("create_icmp_socket ...");
 
     let mut status = PingStats::new();
     status.start_time = Some(Instant::now());
 
     // 先创建socket，这样权限错误会在显示标题前捕获
-    let socket = create_icmpv4_socket(pgConfig)?;
+    let socket = create_icmpv4_socket(pg_config)?;
 
     // 如果使用了pattern，先显示pattern信息（匹配原生ping行为）
-    if !pgConfig.pattern.is_empty() {
-        println!("PATTERN: 0x{}", hex::encode(&pgConfig.pattern));
+    if !pg_config.pattern.is_empty() {
+        println!("PATTERN: 0x{}", hex::encode(&pg_config.pattern));
     }
 
     // 只有socket创建成功才显示标题
-    print_titile(IpAddr::V4(target), pgConfig);
+    print_titile(IpAddr::V4(target), pg_config);
 
-    if pgConfig.connect_sk {
+    if pg_config.connect_sk {
         info!("Connecting to target: {}", target);
         socket
             .connect(&SockAddr::from(SocketAddrV4::new(target, 0)))
@@ -1023,33 +902,32 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
     }
 
     // 洪水模式
-    if pgConfig.flood {
-        flood_ping(&socket, target, pgConfig, &mut status)?;
-        status.print_summary(&pgConfig.domain);
+    if pg_config.flood {
+        flood_ping(&socket, target, pg_config, &mut status)?;
+        status.print_summary(&pg_config.domain);
         return Ok(());
     }
 
     // 预加载模式
-    if pgConfig.preload > 0 {
-        info!("Preloading {} ICMP requests", pgConfig.preload);
-        preload_send_and_receive(&socket, target, pgConfig, &mut status)?;
+    if pg_config.preload > 0 {
+        info!("Preloading {} ICMP requests", pg_config.preload);
+        preload_send_and_receive(&socket, target, pg_config, &mut status)?;
 
         thread::sleep(Duration::from_secs(1));
 
-        if timeout_or_count_exit(pgConfig, &status) {
-            status.print_summary(&pgConfig.domain);
+        if timeout_or_count_exit(pg_config, &status) {
+            status.print_summary(&pg_config.domain);
             return Ok(());
         }
     }
 
     info!("Start pinging target: {}", target.to_string());
-    let mut seq = pgConfig.preload + 1;
-    let mut smoothed_rtt: Option<f64> = None;
-    const ALPHA: f64 = 0.125; // 平滑因子
+    let mut seq = pg_config.preload + 1;
+    let smoothed_rtt: Option<f64> = None;
 
     while is_running() {
-        let request = IcmpEchoRequest::new(seq, pgConfig.identifier, pgConfig.packet_size);
-        let packet = request.build_packet(pgConfig);
+        let request = IcmpEchoRequest::new(seq, pg_config.identifier, pg_config.packet_size);
+        let packet = request.build_packet(pg_config);
         debug!("Sending ICMP packet: seq={}", seq);
         debug!(
             "Built packet length: {}, first 16 bytes: {:?}",
@@ -1058,7 +936,7 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
         );
 
         // 重新设置 RR 选项，确保每个包的指针都从 4 开始，放在发送之前
-        if pgConfig.record_route {
+        if pg_config.record_route {
             // 忽略可能的错误，因为部分系统内核可能不支持重复设置
             if let Err(e) = set_record_route_option(&socket, false) {
                 debug!("reset RR option failed: {}", e);
@@ -1073,15 +951,15 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
         }
 
         // 根据是否启用时间戳选择不同的接收方式
-        if !pgConfig.timestamp.is_empty() {
+        if !pg_config.timestamp.is_empty() {
             // 时间戳模式：使用特殊的接收函数解析时间戳
-            match receive_icmp_reply_with_timestamp(&socket, pgConfig.identifier, pgConfig) {
+            match receive_icmp_reply_with_timestamp(&socket, pg_config.identifier, pg_config) {
                 Ok(reply) => {
                     let receive_seq = reply.sequence;
                     if let Some(sent_time) = status.get_sent_time(receive_seq) {
                         let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0;
 
-                        if pgConfig.audible {
+                        if pg_config.audible {
                             print!("\x07");
                             let _ = std::io::stdout().flush();
                         }
@@ -1089,7 +967,7 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
                         // 时间戳模式显示
                         let message = format!(
                             "{} bytes from {}: icmp_seq={} ttl={} time={:.3} ms",
-                            pgConfig.packet_size + 8,
+                            pg_config.packet_size + 8,
                             reply.source_ip,
                             receive_seq,
                             reply.ttl,
@@ -1097,9 +975,17 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
                         );
                         println!("{}", message);
 
+                        // 显示 timestamp 选项输出（匹配 iputils `ping -T` 行为）
+                        if let Some(all_opts) = reply.ip_options.as_deref() {
+                            // 68 == IPOPT_TS (0x44)
+                            if let Some(ts_opt) = extract_ipv4_option(all_opts, 68) {
+                                print_timestamp_info(&ts_opt, pg_config);
+                            }
+                        }
+
                         // 显示Record Route信息 (在回复信息后)
                         if let Some(data) = reply.ip_options {
-                            parse_record_route_option(&data, pgConfig);
+                            parse_record_route_option(&data, pg_config);
                         }
 
                         status.update(rtt);
@@ -1114,7 +1000,7 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
                     {
                         status.record_error();
                     } else {
-                        if pgConfig.outstanding {
+                        if pg_config.outstanding {
                             println!("No reply yet for sequence {}", seq);
                         }
                         debug!("Failed to receive ICMP reply with timestamp: {}", e);
@@ -1125,7 +1011,7 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
             // 普通模式 - 尝试接收回复，设置适当的超时时间
             match receive_icmp_reply_with_timeout(
                 &socket,
-                pgConfig.identifier,
+                pg_config.identifier,
                 Duration::from_millis(1000),
             ) {
                 Ok(reply) => {
@@ -1133,7 +1019,7 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
                     if let Some(sent_time) = status.get_sent_time(receive_seq) {
                         let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0;
 
-                        if pgConfig.audible {
+                        if pg_config.audible {
                             print!("\x07");
                             let _ = std::io::stdout().flush();
                         }
@@ -1143,17 +1029,17 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
                             receive_seq,
                             rtt,
                             reply.ttl,
-                            pgConfig,
-                            pgConfig.identifier,
+                            pg_config,
+                            pg_config.identifier,
                         );
 
                         // 显示Record Route信息 (在回复信息后)
                         if let Some(data) = reply.ip_options {
-                            parse_record_route_option(&data, pgConfig);
+                            parse_record_route_option(&data, pg_config);
                         }
 
                         // 如果是 -c 模式，统一在这里输出换行  必须换行
-                        if pgConfig.count.is_some() {
+                        if pg_config.count.is_some() {
                             println!();
                         }
 
@@ -1171,7 +1057,7 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
                     {
                         status.record_error();
                     } else {
-                        if pgConfig.outstanding {
+                        if pg_config.outstanding {
                             println!("No reply yet for sequence {}", seq);
                         }
                         debug!("Failed to receive ICMP reply: {}", e);
@@ -1183,7 +1069,7 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
         seq = seq.wrapping_add(1);
 
         // 动态调整间隔
-        if pgConfig.adaptive {
+        if pg_config.adaptive {
             let interval = match smoothed_rtt {
                 Some(avg) => Duration::from_millis((avg * 1.5).max(10.0) as u64),
                 None => Duration::from_millis(100),
@@ -1193,7 +1079,7 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        if timeout_or_count_exit(pgConfig, &status) {
+        if timeout_or_count_exit(pg_config, &status) {
             break;
         }
     }
@@ -1203,7 +1089,7 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
     while final_listen_start.elapsed() < Duration::from_millis(500) {
         if let Ok(reply) = receive_icmp_reply_with_timeout(
             &socket,
-            pgConfig.identifier,
+            pg_config.identifier,
             Duration::from_millis(100),
         ) {
             if let Some(sent_time) = status.get_sent_time(reply.sequence) {
@@ -1213,39 +1099,28 @@ fn ping4_run(target: Ipv4Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::
                     reply.sequence,
                     rtt,
                     reply.ttl,
-                    pgConfig,
-                    pgConfig.identifier,
+                    pg_config,
+                    pg_config.identifier,
                 );
                 status.update(rtt);
 
                 // 显示Record Route信息
                 if let Some(data) = reply.ip_options {
-                    parse_record_route_option(&data, pgConfig);
+                    parse_record_route_option(&data, pg_config);
                 }
             }
         }
     }
 
-    status.print_summary(&pgConfig.domain);
+    status.print_summary(&pg_config.domain);
     Ok(())
-}
-
-// 获取访问目标的本地IP地址
-fn get_local_ip_for_target(target: Ipv4Addr) -> Result<Ipv4Addr, anyhow::Error> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect(format!("{}:53", target))?;
-    let local_addr = socket.local_addr()?;
-    match local_addr.ip() {
-        std::net::IpAddr::V4(ip) => Ok(ip),
-        _ => Err(anyhow::anyhow!("Expected IPv4 address")),
-    }
 }
 
 // 新增：使用常规socket接收带时间戳的回复
 fn receive_icmp_reply_with_timestamp(
     socket: &Socket,
     identifier: u16,
-    config: &PingConfig,
+    _config: &PingConfig,
 ) -> IcmpReplyResult {
     debug!("Receiving ICMP reply with timestamp using socket");
     let mut buffer = [std::mem::MaybeUninit::<u8>::uninit(); PACKET_SIZE];
@@ -1261,13 +1136,9 @@ fn receive_icmp_reply_with_timestamp(
                 })
                 .ok_or(anyhow::anyhow!("Invalid IPv4 packet"))?;
 
-                let mut timestamp_option_data = None;
                 let rr_option_data = if !ipv4_packet.get_options().is_empty() {
                     let mut bytes: Vec<u8> = Vec::new();
                     for opt in ipv4_packet.get_options_iter() {
-                        if opt.get_number() == Ipv4OptionNumbers::TS {
-                            timestamp_option_data = Some(opt.packet().to_vec());
-                        }
                         bytes.extend_from_slice(opt.packet());
                     }
                     Some(bytes)
@@ -1309,11 +1180,6 @@ fn receive_icmp_reply_with_timestamp(
 
                         let src_ip = ipv4_packet.get_source();
                         let ttl = ipv4_packet.get_ttl();
-
-                        // 如果找到时间戳选项，显示时间戳信息
-                        if let Some(data) = &rr_option_data {
-                            parse_record_route_option(data, config);
-                        }
 
                         // 返回结果，优先返回Record Route数据
                         return Ok(IcmpReply {
