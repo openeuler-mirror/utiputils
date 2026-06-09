@@ -1,0 +1,8 @@
+[package]
+name = "utiputils-sys"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+libc = "0.2"
