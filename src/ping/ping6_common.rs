@@ -30,7 +30,7 @@ use crate::{
 };
 
 // IPv6 套接字创建
-fn create_icmpv6_socket(pgConfig: &mut PingConfig) -> anyhow::Result<socket2::Socket> {
+fn create_icmpv6_socket(pg_config: &mut PingConfig) -> anyhow::Result<socket2::Socket> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::RAW,
@@ -41,25 +41,25 @@ fn create_icmpv6_socket(pgConfig: &mut PingConfig) -> anyhow::Result<socket2::So
     // 设置 IPv6 专用选项
     // socket.set_only_v6(true)?;
 
-    if pgConfig.send_buffer_size > 0 {
-        debug!("Setting send buffer size to {}", pgConfig.send_buffer_size);
+    if pg_config.send_buffer_size > 0 {
+        debug!("Setting send buffer size to {}", pg_config.send_buffer_size);
         socket
-            .set_send_buffer_size(pgConfig.send_buffer_size)
+            .set_send_buffer_size(pg_config.send_buffer_size)
             .context("Failed to set send buffer size")?;
     }
 
     // 设置了 interface 参数
-    if !pgConfig.interface.is_empty() {
-        debug!("Binding to interface: {}", pgConfig.interface);
-        let (ip_addr, interface_name) = bind_to_interface_or_ip(&socket, &pgConfig.interface)
+    if !pg_config.interface.is_empty() {
+        debug!("Binding to interface: {}", pg_config.interface);
+        let (ip_addr, interface_name) = bind_to_interface_or_ip(&socket, &pg_config.interface)
             .context("Failed to bind to interface")?;
-        pgConfig.setInterfaceInfo(ip_addr.to_string(), interface_name);
+        pg_config.set_interface_info(ip_addr.to_string(), interface_name);
     }
 
     // 严格源地址
-    if !pgConfig.strictsource.is_empty() {
+    if !pg_config.strictsource.is_empty() {
         debug!("Setting strict source");
-        let strictsource_ip = pgConfig
+        let strictsource_ip = pg_config
             .strictsource
             .parse::<Ipv6Addr>()
             .context("Invalid IPv4 address")?;
@@ -68,18 +68,18 @@ fn create_icmpv6_socket(pgConfig: &mut PingConfig) -> anyhow::Result<socket2::So
         socket
             .bind(&source_sockaddr)
             .context("Failed to bind to strict source")?;
-        pgConfig.setInterfaceInfo(strictsource_ip.to_string(), "".to_string());
+        pg_config.set_interface_info(strictsource_ip.to_string(), "".to_string());
     }
 
     // 设置 mark 参数
-    if let Some(mark) = pgConfig.mark {
+    if let Some(mark) = pg_config.mark {
         if mark > 0 {
             info!("Setting mark");
             socket.set_mark(mark).context("Failed to set mark")?;
         }
     }
 
-    if let Some(tclass) = pgConfig.tclass {
+    if let Some(tclass) = pg_config.tclass {
         if tclass > 0 {
             info!("Setting tclass");
             socket
@@ -89,31 +89,31 @@ fn create_icmpv6_socket(pgConfig: &mut PingConfig) -> anyhow::Result<socket2::So
     }
 
     // 禁用回环
-    if pgConfig.loop_multicast_back {
+    if pg_config.loop_multicast_back {
         socket
             .set_multicast_loop_v6(false)
             .context("Failed to disable multicast loop")?;
     }
 
-    debug!("Setting IPv6 unicast hops to {}", pgConfig.ttl);
-    socket.set_unicast_hops_v6(pgConfig.ttl)?; // IPv6 的 TTL 称为 Hop Limit
+    debug!("Setting IPv6 unicast hops to {}", pg_config.ttl);
+    socket.set_unicast_hops_v6(pg_config.ttl)?; // IPv6 的 TTL 称为 Hop Limit
 
     // 设置超时
     socket
-        .set_read_timeout(Some(pgConfig.timeout))
+        .set_read_timeout(Some(pg_config.timeout))
         .context("Failed to set timeout")?;
 
     // 设置调试模式
-    if pgConfig.debug {
+    if pg_config.debug {
         info!("Enabling debug mode");
         set_socket_option(&socket, libc::SOL_SOCKET, libc::SO_DEBUG, 1)
             .context("Failed to enable debug mode")?;
     }
 
     // 设置 PMTU 发现
-    if !pgConfig.pmtudisc.is_empty() {
+    if !pg_config.pmtudisc.is_empty() {
         info!("Setting PMTU discovery");
-        let optval = match pgConfig.pmtudisc.as_str() {
+        let optval = match pg_config.pmtudisc.as_str() {
             "do" => libc::IPV6_PMTUDISC_DO,
             "dont" => libc::IPV6_PMTUDISC_DONT,
             "want" => libc::IPV6_PMTUDISC_WANT,
@@ -126,18 +126,18 @@ fn create_icmpv6_socket(pgConfig: &mut PingConfig) -> anyhow::Result<socket2::So
     }
 
     // 设置记录路由
-    if pgConfig.record_route {
+    if pg_config.record_route {
         info!("Setting record route");
         set_record_route_option(&socket, true)?;
     }
 
     // 设置时间戳
-    if !pgConfig.timestamp.is_empty() {
+    if !pg_config.timestamp.is_empty() {
         anyhow::bail!("timestamp only supports IPv4");
     }
 
     // 设置流标签
-    if let Some(flowlabel) = pgConfig.flowlabel {
+    if let Some(flowlabel) = pg_config.flowlabel {
         if flowlabel > 0 {
             info!("Setting flowlabel IPv6");
             //设置 flowlabel
@@ -152,10 +152,10 @@ pub fn send_icmpv6_request(
     socket: &Socket,
     target: Ipv6Addr,
     packet: Vec<u8>,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
 ) -> Result<usize, anyhow::Error> {
     let mut flowinfo = 0;
-    if let Some(flowlabel) = pgConfig.flowlabel {
+    if let Some(flowlabel) = pg_config.flowlabel {
         if flowlabel > 0 {
             flowinfo = flowlabel & 0x000FFFFF;
         }
@@ -175,7 +175,7 @@ fn receive_icmpv6_reply(
     debug!("Receiving ICMP reply");
     let mut buffer = Box::new([std::mem::MaybeUninit::<u8>::uninit(); 1500]);
 
-    let mut msgErr: String = String::new();
+    let msg_err: String = String::new();
 
     loop {
         match socket.recv_from(&mut *buffer) {
@@ -187,8 +187,8 @@ fn receive_icmpv6_reply(
                 })
                 .ok_or(anyhow::anyhow!("Invalid ICMPv6 packet"))?;
                 debug!("Received ICMPv6 packet: {:?}", packet);
-                let ipv6Type = packet.get_icmpv6_type();
-                match ipv6Type {
+                let ipv6_type = packet.get_icmpv6_type();
+                match ipv6_type {
                     Icmpv6Types::EchoReply => {
                         debug!("Received ICMPv6 Echo Reply");
                         let echo_reply =
@@ -264,7 +264,7 @@ fn receive_icmpv6_reply(
                         return Err(anyhow::anyhow!("Time exceeded"));
                     }
                     _ => {
-                        let message = format!("ingroe type: {:?}", ipv6Type);
+                        let message = format!("ingroe type: {:?}", ipv6_type);
                         debug!("{}", message);
                         continue;
                     }
@@ -272,22 +272,22 @@ fn receive_icmpv6_reply(
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::TimedOut {
-                    if !msgErr.is_empty() {
-                        warn!("timeout exit, receive error: {}", msgErr);
-                        return Err(anyhow::anyhow!(msgErr));
+                    if !msg_err.is_empty() {
+                        warn!("timeout exit, receive error: {}", msg_err);
+                        return Err(anyhow::anyhow!(msg_err));
                     }
                     return Err(e.into());
                     // return Err(anyhow::anyhow!("Timeout"));
                 } else if e.kind() == std::io::ErrorKind::WouldBlock {
-                    if !msgErr.is_empty() {
-                        warn!("timeout exit, receive error: {}", msgErr);
-                        return Err(anyhow::anyhow!(msgErr));
+                    if !msg_err.is_empty() {
+                        warn!("timeout exit, receive error: {}", msg_err);
+                        return Err(anyhow::anyhow!(msg_err));
                     }
-                    warn!("Receive error: {} {}", msgErr, e);
+                    warn!("Receive error: {} {}", msg_err, e);
                     continue;
                     // return Err(e.into());
                 } else {
-                    warn!("else error: {} {}", msgErr, e);
+                    warn!("else error: {} {}", msg_err, e);
                     return Err(e.into());
                 }
             }
@@ -298,17 +298,17 @@ fn receive_icmpv6_reply(
 fn send_icmpv6_requests(
     socket: &Socket,
     target: Ipv6Addr,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
     seq: u16,
     status: &mut PingStats,
 ) -> Result<(), anyhow::Error> {
     let mut start_seq = seq;
-    for _ in 0..pgConfig.preload {
-        let request = IcmpEchoRequest::new(start_seq, pgConfig.identifier, pgConfig.packet_size);
-        let packet = request.build_packet_V6(pgConfig);
+    for _ in 0..pg_config.preload {
+        let request = IcmpEchoRequest::new(start_seq, pg_config.identifier, pg_config.packet_size);
+        let packet = request.build_packet_v6(pg_config);
         status.record_sent_time(start_seq);
 
-        if let Err(e) = send_icmpv6_request(socket, target, packet, pgConfig) {
+        if let Err(e) = send_icmpv6_request(socket, target, packet, pg_config) {
             error!("Failed to send ICMP request: {}", e);
         }
         start_seq = start_seq.wrapping_add(1);
@@ -319,11 +319,11 @@ fn send_icmpv6_requests(
 fn receive_icmpv6_replies(
     socket: &Socket,
     identifier: u16,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
     status: &mut PingStats,
 ) -> Result<(), anyhow::Error> {
     debug!("Receiving ICMP replies: {:?}", status.sent_times);
-    for _ in 0..pgConfig.preload {
+    for _ in 0..pg_config.preload {
         if !is_running() {
             break;
         }
@@ -335,12 +335,12 @@ fn receive_icmpv6_replies(
                         &IpAddr::V6(src),
                         receive_seq,
                         rtt,
-                        pgConfig.ttl as u8,
-                        pgConfig,
-                        pgConfig.identifier,
+                        pg_config.ttl as u8,
+                        pg_config,
+                        pg_config.identifier,
                     );
                     status.update(rtt);
-                    if pgConfig.audible {
+                    if pg_config.audible {
                         print!("\x07");
                         let _ = std::io::stdout().flush();
                     }
@@ -354,7 +354,7 @@ fn receive_icmpv6_replies(
             }
         }
 
-        if let Some(count) = pgConfig.count {
+        if let Some(count) = pg_config.count {
             if status.transmitted >= count {
                 debug!("Ping count reached, stopping...");
                 break;
@@ -367,18 +367,18 @@ fn receive_icmpv6_replies(
 fn preload_send_and_receive(
     socket: &Socket,
     target: Ipv6Addr,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
     status: &mut PingStats,
 ) -> Result<(), anyhow::Error> {
-    send_icmpv6_requests(socket, target, pgConfig, 1, status)?;
-    receive_icmpv6_replies(socket, pgConfig.identifier, pgConfig, status)?;
+    send_icmpv6_requests(socket, target, pg_config, 1, status)?;
+    receive_icmpv6_replies(socket, pg_config.identifier, pg_config, status)?;
     Ok(())
 }
 
 fn flood_ping_v6(
     socket: &Socket,
     target: Ipv6Addr,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
     status: &mut PingStats,
 ) -> Result<(), anyhow::Error> {
     let mut start_seq = 1;
@@ -387,11 +387,11 @@ fn flood_ping_v6(
             info!("exit flood mode");
             break;
         }
-        let request = IcmpEchoRequest::new(start_seq, pgConfig.identifier, pgConfig.packet_size);
-        let packet = request.build_packet_V6(pgConfig);
+        let request = IcmpEchoRequest::new(start_seq, pg_config.identifier, pg_config.packet_size);
+        let packet = request.build_packet_v6(pg_config);
         status.record_sent_time(start_seq);
 
-        if let Err(e) = send_icmpv6_request(socket, target, packet, pgConfig) {
+        if let Err(e) = send_icmpv6_request(socket, target, packet, pg_config) {
             error!("Failed to send ICMP request: {}", e);
         }
 
@@ -399,7 +399,7 @@ fn flood_ping_v6(
         print!(".");
         let _ = std::io::stdout().flush();
 
-        match receive_icmpv6_reply(socket, pgConfig.identifier) {
+        match receive_icmpv6_reply(socket, pg_config.identifier) {
             Ok((receive_seq, _size, _src)) => {
                 if let Some(sent_time) = status.get_sent_time(receive_seq) {
                     let rtt: f64 = sent_time.elapsed().as_secs_f64() * 1000.0; // 转换为毫秒
@@ -420,7 +420,7 @@ fn flood_ping_v6(
         start_seq = start_seq.wrapping_add(1);
         std::thread::sleep(Duration::from_millis(25));
 
-        if timeout_or_count_exit(pgConfig, status) {
+        if timeout_or_count_exit(pg_config, status) {
             break;
         }
     }
@@ -428,12 +428,12 @@ fn flood_ping_v6(
     Ok(())
 }
 
-pub fn ping6_run(target: Ipv6Addr, pgConfig: &mut PingConfig) -> Result<(), anyhow::Error> {
+pub fn ping6_run(target: Ipv6Addr, pg_config: &mut PingConfig) -> Result<(), anyhow::Error> {
     info!("create_icmp_socket ...");
-    let socket = create_icmpv6_socket(pgConfig)?;
+    let socket = create_icmpv6_socket(pg_config)?;
     info!("create_icmp_socket success ...");
 
-    if pgConfig.connect_sk {
+    if pg_config.connect_sk {
         info!("Connecting to target: {}", target);
         socket
             .connect(&SockAddr::from(SocketAddrV6::new(target, 0, 0, 0)))
@@ -441,53 +441,53 @@ pub fn ping6_run(target: Ipv6Addr, pgConfig: &mut PingConfig) -> Result<(), anyh
     }
 
     // 检查是否是 nodeinfo 查询
-    if !pgConfig.nodeinfo_opt.is_empty() {
-        info!("Running IPv6 nodeinfo query: {}", pgConfig.nodeinfo_opt);
-        return run_nodeinfo_query(&socket, target, pgConfig);
+    if !pg_config.nodeinfo_opt.is_empty() {
+        info!("Running IPv6 nodeinfo query: {}", pg_config.nodeinfo_opt);
+        return run_nodeinfo_query(&socket, target, pg_config);
     }
 
-    let identifier = pgConfig.identifier;
+    let identifier = pg_config.identifier;
     let mut status = PingStats::new();
     status.start_time = Some(Instant::now());
 
     // 如果使用了pattern，先显示pattern信息（匹配原生ping行为）
-    if !pgConfig.pattern.is_empty() {
-        println!("PATTERN: 0x{}", hex::encode(&pgConfig.pattern));
+    if !pg_config.pattern.is_empty() {
+        println!("PATTERN: 0x{}", hex::encode(&pg_config.pattern));
     }
 
-    print_titile(IpAddr::V6(target), pgConfig);
+    print_titile(IpAddr::V6(target), pg_config);
 
-    if pgConfig.flood {
-        flood_ping_v6(&socket, target, pgConfig, &mut status)?;
-        status.print_summary(&pgConfig.domain);
+    if pg_config.flood {
+        flood_ping_v6(&socket, target, pg_config, &mut status)?;
+        status.print_summary(&pg_config.domain);
         return Ok(());
     }
 
-    if pgConfig.preload > 0 {
-        info!("Preloading {} ICMP requests", pgConfig.preload);
-        preload_send_and_receive(&socket, target, pgConfig, &mut status)?;
+    if pg_config.preload > 0 {
+        info!("Preloading {} ICMP requests", pg_config.preload);
+        preload_send_and_receive(&socket, target, pg_config, &mut status)?;
 
         std::thread::sleep(Duration::from_secs(1));
 
-        if timeout_or_count_exit(pgConfig, &status) {
-            status.print_summary(&pgConfig.domain);
+        if timeout_or_count_exit(pg_config, &status) {
+            status.print_summary(&pg_config.domain);
             return Ok(());
         }
     }
 
     info!("Start pinging target: {}", target.to_string());
-    let mut seq = pgConfig.preload + 1;
+    let mut seq = pg_config.preload + 1;
     let mut smoothed_rtt: Option<f64> = None;
     const ALPHA: f64 = 0.125; // 平滑因子
 
     while is_running() {
-        let request = IcmpEchoRequest::new(seq, identifier, pgConfig.packet_size);
-        let packet = request.build_packet_V6(pgConfig);
+        let request = IcmpEchoRequest::new(seq, identifier, pg_config.packet_size);
+        let packet = request.build_packet_v6(pg_config);
         debug!("Sending ICMPv6 packet: seq={}", seq);
 
         // 发送ICMP包
         status.record_sent_time(seq);
-        if let Err(e) = send_icmpv6_request(&socket, target, packet, pgConfig) {
+        if let Err(e) = send_icmpv6_request(&socket, target, packet, pg_config) {
             error!("Failed to send ICMP request: {}", e);
             break;
         }
@@ -506,13 +506,13 @@ pub fn ping6_run(target: Ipv6Addr, pgConfig: &mut PingConfig) -> Result<(), anyh
                         &IpAddr::V6(src),
                         receive_seq,
                         rtt,
-                        pgConfig.ttl as u8,
-                        pgConfig,
-                        pgConfig.identifier,
+                        pg_config.ttl as u8,
+                        pg_config,
+                        pg_config.identifier,
                     );
                     status.update(rtt);
 
-                    if pgConfig.audible {
+                    if pg_config.audible {
                         print!("\x07");
                         let _ = std::io::stdout().flush();
                     }
@@ -535,7 +535,7 @@ pub fn ping6_run(target: Ipv6Addr, pgConfig: &mut PingConfig) -> Result<(), anyh
                 {
                     status.record_error();
                 } else {
-                    if pgConfig.outstanding {
+                    if pg_config.outstanding {
                         println!("No reply yet for sequence {}", seq);
                     }
                     debug!("Failed to receive ICMPv6 reply: {}", e);
@@ -546,7 +546,7 @@ pub fn ping6_run(target: Ipv6Addr, pgConfig: &mut PingConfig) -> Result<(), anyh
         seq = seq.wrapping_add(1);
 
         // 动态调整间隔
-        if pgConfig.adaptive {
+        if pg_config.adaptive {
             let interval = match smoothed_rtt {
                 Some(avg) => Duration::from_millis((avg * 1.5).max(10.0) as u64), // 基础间隔=1.5*RTT，最小10ms
                 None => Duration::from_millis(100),                               // 初始默认间隔
@@ -557,12 +557,12 @@ pub fn ping6_run(target: Ipv6Addr, pgConfig: &mut PingConfig) -> Result<(), anyh
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        if timeout_or_count_exit(pgConfig, &status) {
+        if timeout_or_count_exit(pg_config, &status) {
             break;
         }
     }
 
-    status.print_summary(&pgConfig.domain);
+    status.print_summary(&pg_config.domain);
     Ok(())
 }
 
@@ -570,7 +570,7 @@ pub fn ping6_run(target: Ipv6Addr, pgConfig: &mut PingConfig) -> Result<(), anyh
 fn run_nodeinfo_query(
     socket: &Socket,
     target: Ipv6Addr,
-    pgConfig: &PingConfig,
+    pg_config: &PingConfig,
 ) -> Result<(), anyhow::Error> {
     info!("Starting IPv6 nodeinfo query to: {}", target);
 
@@ -586,7 +586,7 @@ fn run_nodeinfo_query(
     // 主循环 - 像普通ping一样持续发送
     while is_running() {
         // 检查是否达到了count限制
-        if let Some(count) = pgConfig.count {
+        if let Some(count) = pg_config.count {
             if status.transmitted >= count {
                 debug!("Nodeinfo count reached, stopping...");
                 break;
@@ -594,7 +594,7 @@ fn run_nodeinfo_query(
         }
 
         // 构造 nodeinfo 查询包
-        let nodeinfo_packet = build_nodeinfo_packet(&pgConfig.nodeinfo_opt, pgConfig)?;
+        let nodeinfo_packet = build_nodeinfo_packet(&pg_config.nodeinfo_opt, pg_config)?;
 
         // 发送查询
         let send_time = Instant::now();
@@ -626,7 +626,7 @@ fn run_nodeinfo_query(
                 .ok_or(anyhow::anyhow!("Invalid ICMPv6 packet"))?;
 
                 // 解析 nodeinfo 回复
-                let has_real_reply = parse_nodeinfo_reply(&packet, pgConfig)?;
+                let has_real_reply = parse_nodeinfo_reply(&packet, pg_config)?;
 
                 if has_real_reply {
                     let rtt_ms = elapsed.as_secs_f64() * 1000.0;
@@ -657,8 +657,8 @@ fn run_nodeinfo_query(
         seq += 1;
 
         // 间隔等待 - 与普通ping一样
-        if pgConfig.interval > Duration::from_secs(0) {
-            std::thread::sleep(pgConfig.interval);
+        if pg_config.interval > Duration::from_secs(0) {
+            std::thread::sleep(pg_config.interval);
         } else {
             std::thread::sleep(Duration::from_secs(1));
         }
