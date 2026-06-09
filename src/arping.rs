@@ -118,10 +118,6 @@ impl ArgState {
         self.target_mac = Some(mac);
         self.last_update = Instant::now();
     }
-
-    fn is_expired(&self, timeout: u32) -> bool {
-        self.last_update.elapsed().as_secs() > timeout as u64
-    }
 }
 
 pub fn main() {
