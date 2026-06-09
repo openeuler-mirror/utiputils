@@ -28,9 +28,6 @@ use anyhow::Result;
 const MAX_HOPS: u8 = 30; // 最大跳数
 const BASE_PORT: u16 = 44444; // 基准端口号
 const BASE_MTU: u16 = 1500; // 基准MTU
-const TIMEOUT_MS: u64 = 100; // 缩短超时时间，提高性能
-const WAIT_STEP_MS: u64 = 1000; // 缩短等待间隔，提高性能
-const TTL_INTERVAL_MS: u64 = 10; // 缩短TTL间隔，提高性能
 
 // IPv6错误队列相关常量
 const IPV6_RECVERR: i32 = 25;
@@ -130,8 +127,6 @@ impl TracepathConfig {
 
 #[derive(Debug)]
 struct RunState {
-    exit: bool,
-    start_time: Instant,
     target: IpAddr,
     ttl: u8,
     hops_from: u8,
@@ -146,8 +141,6 @@ struct RunState {
 impl Default for RunState {
     fn default() -> Self {
         Self {
-            exit: false,
-            start_time: Instant::now(),
             target: IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             ttl: 1,
             hops_from: 0,
@@ -164,7 +157,6 @@ impl Default for RunState {
 #[derive(Debug)]
 struct ResolveResult {
     address: IpAddr,
-    hostname: String,
 }
 
 fn resolve(destination: &str, tp_config: &TracepathConfig) -> Result<ResolveResult, anyhow::Error> {
@@ -179,10 +171,7 @@ fn resolve(destination: &str, tp_config: &TracepathConfig) -> Result<ResolveResu
                 return Err(anyhow::anyhow!("IPv6 address specified but -4 option used"));
             }
             _ => {
-                return Ok(ResolveResult {
-                    address: addr,
-                    hostname: destination.to_string(),
-                });
+                return Ok(ResolveResult { address: addr });
             }
         }
     }
@@ -211,10 +200,7 @@ fn resolve(destination: &str, tp_config: &TracepathConfig) -> Result<ResolveResu
     };
 
     if let Some(addr) = preferred_addr {
-        Ok(ResolveResult {
-            address: addr.ip(),
-            hostname: destination.to_string(),
-        })
+        Ok(ResolveResult { address: addr.ip() })
     } else {
         Err(anyhow::anyhow!(
             "Unable to resolve destination: {}",
@@ -514,71 +500,48 @@ fn create_udp_socket_ipv6() -> std::result::Result<std::net::UdpSocket, anyhow::
     let fd = socket.as_raw_fd();
     let enable = 1i32;
 
-    unsafe {
-        // 设置IPV6_MTU_DISCOVER以启用PMTU发现
-        let pmtu_probe = 2i32; // IPV6_PMTUDISC_PROBE
-        let ret = libc::setsockopt(
+    // 设置IPV6_MTU_DISCOVER以启用PMTU发现
+    let pmtu_probe = 2i32; // IPV6_PMTUDISC_PROBE
+    if let Err(e) = utiputils_sys::sockopt::setsockopt_int(
+        fd,
+        libc::IPPROTO_IPV6,
+        libc::IPV6_MTU_DISCOVER,
+        pmtu_probe,
+    ) {
+        // 如果PROBE模式失败，尝试DO模式
+        let pmtu_do = 1i32; // IPV6_PMTUDISC_DO
+        if let Err(e2) = utiputils_sys::sockopt::setsockopt_int(
             fd,
             libc::IPPROTO_IPV6,
             libc::IPV6_MTU_DISCOVER,
-            &pmtu_probe as *const _ as *const libc::c_void,
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        );
-        if ret != 0 {
-            // 如果PROBE模式失败，尝试DO模式
-            let pmtu_do = 1i32; // IPV6_PMTUDISC_DO
-            let ret2 = libc::setsockopt(
-                fd,
-                libc::IPPROTO_IPV6,
-                libc::IPV6_MTU_DISCOVER,
-                &pmtu_do as *const _ as *const libc::c_void,
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            );
-            if ret2 != 0 {
-                debug!(
-                    "Failed to set IPV6_MTU_DISCOVER: {}",
-                    std::io::Error::last_os_error()
-                );
-            } else {
-                debug!("Successfully set IPV6_MTU_DISCOVER (DO mode)");
-            }
+            pmtu_do,
+        ) {
+            debug!("Failed to set IPV6_MTU_DISCOVER: {}", e2);
         } else {
-            debug!("Successfully set IPV6_MTU_DISCOVER (PROBE mode)");
+            debug!("Successfully set IPV6_MTU_DISCOVER (DO mode)");
         }
 
-        // 设置IPV6_RECVERR以接收错误队列
-        let ret = libc::setsockopt(
-            fd,
-            libc::IPPROTO_IPV6,
-            IPV6_RECVERR,
-            &enable as *const _ as *const libc::c_void,
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        );
-        if ret != 0 {
-            debug!(
-                "Failed to set IPV6_RECVERR: {}",
-                std::io::Error::last_os_error()
-            );
-        } else {
-            debug!("Successfully set IPV6_RECVERR");
-        }
+        debug!("Failed to set IPV6_MTU_DISCOVER (PROBE mode): {}", e);
+    } else {
+        debug!("Successfully set IPV6_MTU_DISCOVER (PROBE mode)");
+    }
 
-        // 设置IPV6_HOPLIMIT以接收hop limit信息
-        let ret = libc::setsockopt(
-            fd,
-            libc::IPPROTO_IPV6,
-            IPV6_HOPLIMIT,
-            &enable as *const _ as *const libc::c_void,
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        );
-        if ret != 0 {
-            debug!(
-                "Failed to set IPV6_HOPLIMIT: {}",
-                std::io::Error::last_os_error()
-            );
-        } else {
-            debug!("Successfully set IPV6_HOPLIMIT");
-        }
+    // 设置IPV6_RECVERR以接收错误队列
+    if let Err(e) =
+        utiputils_sys::sockopt::setsockopt_int(fd, libc::IPPROTO_IPV6, IPV6_RECVERR, enable)
+    {
+        debug!("Failed to set IPV6_RECVERR: {}", e);
+    } else {
+        debug!("Successfully set IPV6_RECVERR");
+    }
+
+    // 设置IPV6_HOPLIMIT以接收hop limit信息
+    if let Err(e) =
+        utiputils_sys::sockopt::setsockopt_int(fd, libc::IPPROTO_IPV6, IPV6_HOPLIMIT, enable)
+    {
+        debug!("Failed to set IPV6_HOPLIMIT: {}", e);
+    } else {
+        debug!("Successfully set IPV6_HOPLIMIT");
     }
 
     debug!("Created IPv6 UDP socket with error queue support");
@@ -607,20 +570,13 @@ fn send_udp_probe_ipv6(
     let fd = socket.as_raw_fd();
     let hop_limit = run_state.ttl as i32;
 
-    unsafe {
-        let ret = libc::setsockopt(
-            fd,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_UNICAST_HOPS,
-            &hop_limit as *const _ as *const libc::c_void,
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        );
-        if ret != 0 {
-            debug!(
-                "Failed to set hop limit: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+    if let Err(e) = utiputils_sys::sockopt::setsockopt_int(
+        fd,
+        libc::IPPROTO_IPV6,
+        libc::IPV6_UNICAST_HOPS,
+        hop_limit,
+    ) {
+        debug!("Failed to set hop limit: {}", e);
     }
 
     // 对于IPv6链路本地地址，需要特殊处理
@@ -1122,14 +1078,14 @@ fn create_transport_channel(
     Ok((tx, rx))
 }
 
-fn send_udp_probe(tp_config: &TracepathConfig, runState: &mut RunState) -> anyhow::Result<()> {
+fn send_udp_probe(tp_config: &TracepathConfig, run_state: &mut RunState) -> anyhow::Result<()> {
     // 创建socket
     info!(
         "send probe to {:?} with ttl {}",
-        runState.target, runState.ttl
+        run_state.target, run_state.ttl
     );
 
-    let is_ipv6 = runState.target.is_ipv6();
+    let is_ipv6 = run_state.target.is_ipv6();
 
     // 绑定到所有接口
     let bind_address: std::net::SocketAddr = if is_ipv6 {
@@ -1147,15 +1103,15 @@ fn send_udp_probe(tp_config: &TracepathConfig, runState: &mut RunState) -> anyho
     if is_ipv6 {
         // 对于IPv6，需要使用socket2来设置hop limit
         let socket2_udp = socket2::Socket::from(udp_socket);
-        socket2_udp.set_unicast_hops_v6(runState.ttl as u32)?;
+        socket2_udp.set_unicast_hops_v6(run_state.ttl as u32)?;
         let udp_socket: UdpSocket = socket2_udp.into();
 
         // 优化：设置发送超时，避免长时间阻塞
         udp_socket.set_write_timeout(Some(Duration::from_millis(100)))?;
 
         // 构建目标地址 - 使用运行状态中的hisptr而不是TTL，保持与原生tracepath一致
-        let dest_port = tp_config.get_port() + runState.hisptr as u16;
-        let target_addr = std::net::SocketAddr::new(runState.target, dest_port);
+        let dest_port = tp_config.get_port() + run_state.hisptr as u16;
+        let target_addr = std::net::SocketAddr::new(run_state.target, dest_port);
 
         let payload = vec![0u8; (tp_config.get_length() - 28) as usize];
 
@@ -1163,27 +1119,27 @@ fn send_udp_probe(tp_config: &TracepathConfig, runState: &mut RunState) -> anyho
         match udp_socket.send_to(&payload, target_addr) {
             Ok(_) => {
                 // 记录成功发送的时间
-                runState.send_time = Some(Instant::now());
+                run_state.send_time = Some(Instant::now());
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 非阻塞发送可能会返回WouldBlock，短暂等待后重试
                 std::thread::sleep(Duration::from_millis(1));
                 udp_socket.send_to(&payload, target_addr)?;
-                runState.send_time = Some(Instant::now());
+                run_state.send_time = Some(Instant::now());
             }
             Err(e) => {
                 return Err(e.into());
             }
         }
     } else {
-        udp_socket.set_ttl(runState.ttl as u32)?;
+        udp_socket.set_ttl(run_state.ttl as u32)?;
 
         // 优化：设置发送超时，避免长时间阻塞
         udp_socket.set_write_timeout(Some(Duration::from_millis(100)))?;
 
         // 构建目标地址 - 使用运行状态中的hisptr而不是TTL，保持与原生tracepath一致
-        let dest_port = tp_config.get_port() + runState.hisptr as u16;
-        let target_addr = std::net::SocketAddr::new(runState.target, dest_port);
+        let dest_port = tp_config.get_port() + run_state.hisptr as u16;
+        let target_addr = std::net::SocketAddr::new(run_state.target, dest_port);
 
         let payload = vec![0u8; (tp_config.get_length() - 28) as usize];
 
@@ -1191,13 +1147,13 @@ fn send_udp_probe(tp_config: &TracepathConfig, runState: &mut RunState) -> anyho
         match udp_socket.send_to(&payload, target_addr) {
             Ok(_) => {
                 // 记录成功发送的时间
-                runState.send_time = Some(Instant::now());
+                run_state.send_time = Some(Instant::now());
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 非阻塞发送可能会返回WouldBlock，短暂等待后重试
                 std::thread::sleep(Duration::from_millis(1));
                 udp_socket.send_to(&payload, target_addr)?;
-                runState.send_time = Some(Instant::now());
+                run_state.send_time = Some(Instant::now());
             }
             Err(e) => {
                 return Err(e.into());
@@ -1208,7 +1164,7 @@ fn send_udp_probe(tp_config: &TracepathConfig, runState: &mut RunState) -> anyho
     debug!("udp socket packet sent successfully");
 
     // 更新hisptr指针（按照原生tracepath.c的逻辑）
-    runState.hisptr = (runState.hisptr + 1) & (HIS_ARRAY_SIZE - 1);
+    run_state.hisptr = (run_state.hisptr + 1) & (HIS_ARRAY_SIZE - 1);
 
     Ok(())
 }
@@ -1361,20 +1317,13 @@ fn perform_pmtu_discovery(
     let fd = socket.as_raw_fd();
     let hop_limit = 1i32;
 
-    unsafe {
-        let ret = libc::setsockopt(
-            fd,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_UNICAST_HOPS,
-            &hop_limit as *const _ as *const libc::c_void,
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        );
-        if ret != 0 {
-            debug!(
-                "Failed to set hop limit for PMTU discovery: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+    if let Err(e) = utiputils_sys::sockopt::setsockopt_int(
+        fd,
+        libc::IPPROTO_IPV6,
+        libc::IPV6_UNICAST_HOPS,
+        hop_limit,
+    ) {
+        debug!("Failed to set hop limit for PMTU discovery: {}", e);
     }
 
     // 构建目标地址
