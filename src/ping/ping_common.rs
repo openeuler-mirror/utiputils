@@ -45,24 +45,17 @@ pub struct IcmpEchoRequest {
 
 impl IcmpEchoRequest {
     pub fn new(sequence: u16, identifier: u16, size: usize) -> Self {
-        // 创建与原生ping兼容的数据负载
+        // 创建与原生 ping 兼容的数据负载。
+        // Linux iputils 的 ping 在 ICMP 数据区开头写入 struct timeval（native layout + native endian），
+        // Wireshark/tshark 会基于该格式做启发式解析；如果我们写入的端序/布局不一致，
+        // 抓包里用 `data.len` 之类字段观察时会出现“长度差 8”的假象。
         let mut payload = vec![0; size];
 
-        if size >= 8 {
-            // 前8字节：时间戳数据（模拟原生ping的格式）
-            let timestamp = get_timestamp_ms();
-            payload[0..4].copy_from_slice(&timestamp.to_be_bytes());
-            // 字节4-7保持为0（与原生ping一致）
+        let prefix_len = fill_ping_timeval_prefix(&mut payload);
 
-            // 后续字节：递增模式数据（从0x10开始）
-            for (i, item) in payload.iter_mut().enumerate().take(size).skip(8) {
-                *item = (0x10 + (i - 8)) as u8;
-            }
-        } else {
-            // 对于小尺寸，全部使用递增模式
-            for (i, item) in payload.iter_mut().enumerate().take(size) {
-                *item = (0x10 + i) as u8;
-            }
+        // 后续字节：递增模式数据（从 0x10 开始）
+        for (i, item) in payload.iter_mut().enumerate().take(size).skip(prefix_len) {
+            *item = (0x10u8).wrapping_add((i - prefix_len) as u8);
         }
 
         Self {
@@ -72,7 +65,7 @@ impl IcmpEchoRequest {
         }
     }
 
-    pub fn build_packet(&self, pgConfig: &PingConfig) -> Vec<u8> {
+    pub fn build_packet(&self, pg_config: &PingConfig) -> Vec<u8> {
         // 对于时间戳选项，使用普通ICMP包
         // socket级别的IP_OPTIONS会自动添加时间戳选项
         // 这样更接近原生ping的实现
@@ -87,11 +80,11 @@ impl IcmpEchoRequest {
         packet.set_payload(&self.payload);
 
         // 设置填充数据
-        if !pgConfig.pattern.is_empty() {
-            debug!("fill pattern: {:?}", pgConfig.pattern);
+        if !pg_config.pattern.is_empty() {
+            debug!("fill pattern: {:?}", pg_config.pattern);
             let data = packet.payload_mut();
             for (i, item) in data.iter_mut().enumerate() {
-                *item = pgConfig.pattern[i % pgConfig.pattern.len()]; // 循环填充
+                *item = pg_config.pattern[i % pg_config.pattern.len()]; // 循环填充
             }
         }
 
@@ -101,7 +94,7 @@ impl IcmpEchoRequest {
         buffer
     }
 
-    pub fn build_packet_with_timestamp(&self, pgConfig: &PingConfig) -> Vec<u8> {
+    pub fn build_packet_with_timestamp(&self, pg_config: &PingConfig) -> Vec<u8> {
         // 总长度 = IP头(20) + 时间戳选项(40) + ICMP头(8) + 负载
         let total_len = IPV4_HEADER_LEN + TIMESTAMP_OPTION_LEN + 8 + self.payload.len();
         let mut buffer = vec![0u8; total_len];
@@ -112,7 +105,7 @@ impl IcmpEchoRequest {
         ip_packet.set_version(4);
         ip_packet.set_header_length((IPV4_HEADER_LEN + TIMESTAMP_OPTION_LEN) as u8 / 4); // 头长度包括选项
         ip_packet.set_total_length(total_len as u16);
-        ip_packet.set_ttl(pgConfig.ttl as u8);
+        ip_packet.set_ttl(pg_config.ttl as u8);
         ip_packet.set_next_level_protocol(IpNextHeaderProtocols::Icmp);
 
         // 源地址和目标地址将由发送函数设置
@@ -122,7 +115,7 @@ impl IcmpEchoRequest {
         options[0] = IPOPT_TIMESTAMP; // 时间戳选项类型 0x44
         options[1] = TIMESTAMP_OPTION_LEN as u8; // 选项长度 40
         options[2] = 5; // 指针位置 (从第5字节开始填充时间戳)
-        options[3] = match pgConfig.timestamp.as_str() {
+        options[3] = match pg_config.timestamp.as_str() {
             "tsonly" => 0,    // 仅时间戳
             "tsandaddr" => 1, // 时间戳和地址
             "tsprespec" => 3, // 预指定地址
@@ -130,7 +123,7 @@ impl IcmpEchoRequest {
         };
 
         // 对于 tsonly 模式，确保预留足够的时间戳槽位
-        if pgConfig.timestamp == "tsonly" {
+        if pg_config.timestamp == "tsonly" {
             // 不预填充任何时间戳，让网络协议栈自动处理
             // 这样可以确保与原生ping的行为一致
             // 时间戳槽位布局：
@@ -157,11 +150,11 @@ impl IcmpEchoRequest {
         icmp_packet.set_payload(&self.payload);
 
         // 设置填充数据
-        if !pgConfig.pattern.is_empty() {
-            debug!("fill pattern: {:?}", pgConfig.pattern);
+        if !pg_config.pattern.is_empty() {
+            debug!("fill pattern: {:?}", pg_config.pattern);
             let data = icmp_packet.payload_mut();
             for (i, item) in data.iter_mut().enumerate() {
-                *item = pgConfig.pattern[i % pgConfig.pattern.len()];
+                *item = pg_config.pattern[i % pg_config.pattern.len()];
             }
         }
 
@@ -172,7 +165,7 @@ impl IcmpEchoRequest {
         buffer
     }
 
-    pub fn build_packet_V6(&self, pgConfig: &PingConfig) -> Vec<u8> {
+    pub fn build_packet_v6(&self, pg_config: &PingConfig) -> Vec<u8> {
         let mut buffer = vec![0u8; 8 + self.payload.len()];
         let mut packet =
             pnet::packet::icmpv6::echo_request::MutableEchoRequestPacket::new(&mut buffer).unwrap();
@@ -183,11 +176,11 @@ impl IcmpEchoRequest {
         packet.set_payload(&self.payload);
 
         // 设置填充数据
-        if !pgConfig.pattern.is_empty() {
-            debug!("fill pattern: {:?}", pgConfig.pattern);
+        if !pg_config.pattern.is_empty() {
+            debug!("fill pattern: {:?}", pg_config.pattern);
             let data = packet.payload_mut();
             for (i, item) in data.iter_mut().enumerate() {
-                *item = pgConfig.pattern[i % pgConfig.pattern.len()]; // 循环填充
+                *item = pg_config.pattern[i % pg_config.pattern.len()]; // 循环填充
             }
         }
 
@@ -198,13 +191,48 @@ impl IcmpEchoRequest {
     }
 }
 
-// 获取类似原生ping的时间戳（struct timeval格式）
-fn get_timestamp_ms() -> u32 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    // 原生ping使用gettimeofday()，在ICMP数据中存储struct timeval
-    // struct timeval { tv_sec, tv_usec }，但只存储tv_sec的低32位
-    // 这样更接近原生ping的行为，且能被tshark识别为时间戳
-    now.as_secs() as u32
+// 将 Linux ping 的时间戳前缀写入 ICMP payload，返回占用的字节数。
+// - 优先写入完整的 `libc::timeval`（native layout/endian），与 iputils ping 的 `memcpy(&tv)` 一致。
+// - 若 payload 太小，退化为写入 8 字节（u32 秒 + u32 微秒，native endian）。
+fn fill_ping_timeval_prefix(payload: &mut [u8]) -> usize {
+    if payload.is_empty() {
+        return 0;
+    }
+
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+
+    let secs = now.as_secs();
+    let usecs = now.subsec_micros();
+
+    let tv = libc::timeval {
+        tv_sec: secs as libc::time_t,
+        tv_usec: usecs as libc::suseconds_t,
+    };
+
+    let tv_size = mem::size_of::<libc::timeval>();
+    if payload.len() >= tv_size {
+        // SAFETY: `tv` fully initialized; reading its bytes is ok for serialization.
+        let tv_bytes = unsafe {
+            std::slice::from_raw_parts((&tv as *const libc::timeval) as *const u8, tv_size)
+        };
+        payload[..tv_size].copy_from_slice(tv_bytes);
+        return tv_size;
+    }
+
+    if payload.len() >= 8 {
+        payload[0..4].copy_from_slice(&(secs as u32).to_ne_bytes());
+        payload[4..8].copy_from_slice(&usecs.to_ne_bytes());
+        return 8;
+    }
+
+    // payload 太短：尽量写入秒数的低字节
+    let sec_bytes = (secs as u32).to_ne_bytes();
+    let n = payload.len().min(sec_bytes.len());
+    payload[..n].copy_from_slice(&sec_bytes[..n]);
+    n
 }
 
 pub fn set_socket_option(
@@ -213,19 +241,7 @@ pub fn set_socket_option(
     optname: libc::c_int,
     optval: libc::c_int,
 ) -> Result<(), std::io::Error> {
-    unsafe {
-        let ret = libc::setsockopt(
-            socket.as_raw_fd(),
-            level,
-            optname,
-            &optval as *const _ as *const libc::c_void,
-            mem::size_of_val(&optval) as libc::socklen_t,
-        );
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
+    utiputils_sys::sockopt::setsockopt_int(socket.as_raw_fd(), level, optname, optval)
 }
 
 pub fn set_socket_opt(
@@ -234,19 +250,7 @@ pub fn set_socket_opt(
     optname: libc::c_int,
     optval: &[u8],
 ) -> io::Result<()> {
-    unsafe {
-        let ret = libc::setsockopt(
-            socket.as_raw_fd(),
-            level,
-            optname,
-            optval.as_ptr() as *const libc::c_void,
-            optval.len() as libc::socklen_t,
-        );
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
+    utiputils_sys::sockopt::setsockopt_bytes(socket.as_raw_fd(), level, optname, optval)
 }
 
 // 设置记录路由选项
@@ -324,13 +328,13 @@ pub fn bind_to_interface_or_ip(
     }
 }
 
-pub fn print_titile(target: IpAddr, pgConfig: &PingConfig) {
+pub fn print_titile(target: IpAddr, pg_config: &PingConfig) {
     // 根据IP版本决定格式
     match target {
         IpAddr::V6(_) => {
             // IPv6格式：PING hostname(hostname (ip)) 56 data bytes
             // 检查是否为直接IP输入
-            let is_direct_ip_input = pgConfig
+            let is_direct_ip_input = pg_config
                 .host
                 .as_ref()
                 .map(|h| h.parse::<IpAddr>().is_ok())
@@ -341,50 +345,50 @@ pub fn print_titile(target: IpAddr, pgConfig: &PingConfig) {
                 format!("{}({})", target, target)
             } else {
                 // 域名输入：PING hostname(hostname (ip)) 56 data bytes
-                format!("{}({} ({}))", pgConfig.domain, pgConfig.domain, target)
+                format!("{}({} ({}))", pg_config.domain, pg_config.domain, target)
             };
 
-            if !pgConfig.interface.is_empty() || !pgConfig.strictsource.is_empty() {
-                let interfaceInfo = format!(
+            if !pg_config.interface.is_empty() || !pg_config.strictsource.is_empty() {
+                let interface_info = format!(
                     "from {} {}",
-                    pgConfig.getInterfaceInfo().0,
-                    pgConfig.getInterfaceInfo().1
+                    pg_config.get_interface_info().0,
+                    pg_config.get_interface_info().1
                 );
                 println!(
                     "PING {} {} {} data bytes",
-                    title_format, interfaceInfo, pgConfig.packet_size
+                    title_format, interface_info, pg_config.packet_size
                 );
             } else {
-                println!("PING {} {} data bytes", title_format, pgConfig.packet_size);
+                println!("PING {} {} data bytes", title_format, pg_config.packet_size);
             }
         }
         IpAddr::V4(_) => {
             // IPv4格式：PING target (target) 56(84) bytes of data.
-            let data_size = pgConfig.packet_size;
+            let data_size = pg_config.packet_size;
             let mut total_size = data_size + 8 + IPV4_HEADER_LEN; // 数据 + ICMP + IP头
 
             // 根据启用的选项计算额外的字节数
-            if !pgConfig.timestamp.is_empty() {
+            if !pg_config.timestamp.is_empty() {
                 total_size += TIMESTAMP_OPTION_LEN; // 时间戳选项 40字节
             }
-            if pgConfig.record_route {
+            if pg_config.record_route {
                 total_size += 40; // Record Route选项 40字节
             }
 
-            if !pgConfig.interface.is_empty() || !pgConfig.strictsource.is_empty() {
-                let interfaceInfo = format!(
+            if !pg_config.interface.is_empty() || !pg_config.strictsource.is_empty() {
+                let interface_info = format!(
                     "from {} {}",
-                    pgConfig.getInterfaceInfo().0,
-                    pgConfig.getInterfaceInfo().1
+                    pg_config.get_interface_info().0,
+                    pg_config.get_interface_info().1
                 );
                 println!(
                     "PING {} ({}) {} {}({}) bytes of data.",
-                    pgConfig.domain, target, interfaceInfo, data_size, total_size
+                    pg_config.domain, target, interface_info, data_size, total_size
                 );
             } else {
                 println!(
                     "PING {} ({}) {}({}) bytes of data.",
-                    pgConfig.domain, target, data_size, total_size
+                    pg_config.domain, target, data_size, total_size
                 );
             }
         }
@@ -606,8 +610,8 @@ fn get_interface_for_link_local(ipv6: &std::net::Ipv6Addr) -> String {
     "lo".to_string()
 }
 
-pub fn timeout_or_count_exit(pgConfig: &PingConfig, status: &PingStats) -> bool {
-    if let Some(count) = pgConfig.count {
+pub fn timeout_or_count_exit(pg_config: &PingConfig, status: &PingStats) -> bool {
+    if let Some(count) = pg_config.count {
         if status.transmitted >= count {
             info!("Ping count reached, stopping...");
             RUNNING.store(false, Ordering::SeqCst);
@@ -615,8 +619,8 @@ pub fn timeout_or_count_exit(pgConfig: &PingConfig, status: &PingStats) -> bool 
         }
     }
 
-    if pgConfig.deadline > Duration::from_secs(0)
-        && pgConfig.getStartTime().elapsed() >= pgConfig.deadline
+    if pg_config.deadline > Duration::from_secs(0)
+        && pg_config.get_start_time().elapsed() >= pg_config.deadline
     {
         info!("Deadline reached, stopping...");
         RUNNING.store(false, Ordering::SeqCst);
