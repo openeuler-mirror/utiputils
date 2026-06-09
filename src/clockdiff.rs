@@ -50,14 +50,17 @@ struct ClockDiffResult {
 }
 
 // 执行结果
-
+const HOSTDOWN: i64 = i64::MAX;
 #[derive(Debug, Default)]
 struct SumResult {
     host: String,
-    delta1: Vec<i64>,
-    delta2: Vec<i64>,
-    rtt_sum: Vec<i64>,
-    rtt_min: Option<i64>,
+    measure_delta: i64,
+    measure_delta1: i64,
+    rtt: i64,
+    rtt_min: i64,
+    rtt_sigma: i64,
+    min1: i64,
+    min2: i64,
     time_format: Option<String>,
 }
 impl SumResult {
@@ -65,34 +68,63 @@ impl SumResult {
         SumResult {
             host: host.to_string(),
             time_format,
+            rtt_min: i64::MAX,
+            measure_delta: HOSTDOWN,
+            measure_delta1: HOSTDOWN,
             ..Default::default()
         }
     }
 
-    fn add(&mut self, delta1: i64, delta2: i64, rtt: i64) {
-        self.delta1.push(delta1);
-        self.delta2.push(delta2);
+    fn calculate_delta(&mut self, ip_timestamp: bool, res: &ClockDiffResult) -> u8 {
+        let t1 = res.local_send_time; // sendtime
+        let t2 = res.remote_recv_time; // histime
+        let t3 = res.remote_send_time; // histime1
+        let t4 = res.local_recv_time; // recvtime
 
-        self.rtt_sum.push(rtt);
-        if rtt < self.rtt_min.unwrap_or(i64::MAX) {
-            self.rtt_min = Some(rtt);
+        let diff = t4 - t1;
+        if diff < 0 {
+            return 5;
         }
+        self.rtt = (self.rtt * 3 + diff) / 4;
+        self.rtt_sigma = (self.rtt_sigma + (diff - self.rtt).abs()) / 4;
+
+        let mut delta1 = t2 - t1; // 正向延迟
+        let mut delta2 = if ip_timestamp { t4 - t3 } else { t4 - t2 }; // 反向延迟
+
+        if delta1 < BIASN {
+            delta1 += MODULO;
+        } else if delta1 > BIASP {
+            delta1 -= MODULO;
+        }
+
+        if delta2 < BIASN {
+            delta2 += MODULO;
+        } else if delta2 > BIASP {
+            delta2 -= MODULO;
+        }
+
+        if delta1 < self.min1 {
+            self.min1 = delta1;
+        }
+        if delta2 < self.min2 {
+            self.min2 = delta2;
+        }
+
+        if delta1 + delta2 < self.rtt_min {
+            self.rtt_min = delta1 + delta2;
+            self.measure_delta1 = (delta1 - delta2) / 2;
+        }
+
+        if diff < 1 {
+            self.min1 = delta1;
+            self.min2 = delta2;
+            return 4;
+        }
+        5
     }
 
     fn print_summary(&self) {
         let datetime = Local::now();
-
-        if self.rtt_sum.is_empty() {
-            println!("clockdiff: {} is down", self.host);
-            return;
-        }
-
-        let count = self.rtt_sum.len() as i64;
-        let avg_rtt = self.rtt_sum.iter().sum::<i64>() / count;
-        let avg_std = self.standard_deviation(&self.rtt_sum);
-
-        let avg_delta1 = self.delta1.iter().sum::<i64>() / count;
-        let avg_delta2 = self.delta2.iter().sum::<i64>() / count;
 
         let format = match self.time_format.as_deref() {
             Some("iso") => "%Y-%m-%dT%H:%M:%S%z",
@@ -103,26 +135,14 @@ impl SumResult {
         let display_summery = format!(
             "\nhost={} rtt={}({})ms/{}ms delta={}ms/{}ms {}\n",
             self.host,
-            avg_rtt,
-            avg_std,
-            self.rtt_min.unwrap_or(0),
-            avg_delta1,
-            avg_delta2,
+            self.rtt,
+            self.rtt_sigma,
+            self.rtt_min,
+            self.measure_delta,
+            self.measure_delta1,
             datetime.format(format)
         );
         print!("{}", display_summery);
-    }
-
-    // 计算标准差（样本标准差，n-1）
-    fn standard_deviation(&self, data: &[i64]) -> i64 {
-        let avg = data.iter().sum::<i64>() / data.len() as i64;
-
-        let variance = data
-            .iter()
-            .map(|v| ((*v - avg) as f64).powi(2))
-            .sum::<f64>()
-            / (data.len() - 1) as f64;
-        variance.sqrt() as i64
     }
 }
 
@@ -246,9 +266,9 @@ fn clockdiff_run(
     // 创建ICMP传输通道
     let (mut tx, mut rx) = create_icmp_channel()?;
 
-    let mut sumResult = SumResult::new(&ip.to_string(), options.get_time_format());
+    let mut sum_result = SumResult::new(&ip.to_string(), options.get_time_format());
 
-    let sourceIP = get_default_ip();
+    let source_ip = get_default_ip();
 
     let identifier = process::id() as u16;
     for index in 0..MSGS {
@@ -260,7 +280,7 @@ fn clockdiff_run(
             // 构造IP时间戳选项
             info!("build ip timestamp packet");
             let buffer =
-                build_ipv4_packet_with_timestamp(options, index as u16, identifier, sourceIP, ip);
+                build_ipv4_packet_with_timestamp(options, index as u16, identifier, source_ip, ip);
 
             let ip_packet = Ipv4Packet::new(&buffer).ok_or("Failed to create IPv4 packet")?;
             tx.send_to(ip_packet, IpAddr::V4(ip))?;
@@ -268,7 +288,8 @@ fn clockdiff_run(
             // 构造ICMP Timestamp请求
             info!("build icmp timestamp packet");
 
-            let buffer = match build_icmp_timestamp_packet(sourceIP, ip, identifier, index as u16) {
+            let buffer = match build_icmp_timestamp_packet(source_ip, ip, identifier, index as u16)
+            {
                 Ok(buf) => buf,
                 Err(e) => {
                     return Err(format!("Failed to build ICMP timestamp packet: {}", e).into())
@@ -307,10 +328,8 @@ fn clockdiff_run(
 
                                 let payload = icmp_pkt.payload();
                                 let result = parse_timestamps(payload)?;
-                                let (delta1, delta2) = calculate_delta(&result);
-                                let rtt = calculate_rtt(&result);
-                                debug!("delta1: {:?}, delta2: {} rtt: {:?}", delta1, delta2, rtt);
-                                sumResult.add(delta1, delta2, rtt);
+                                let _res =
+                                    sum_result.calculate_delta(options.ip_timestamp, &result);
                             }
                         }
                     }
@@ -320,8 +339,13 @@ fn clockdiff_run(
                         ip_pkt.get_options_iter().for_each(|opt| {
                             if opt.get_number() == Ipv4OptionNumbers::TS {
                                 let data = opt.packet();
-                                let (rtt, delta1, delta2) = parse_timestamp_option(data);
-                                sumResult.add(delta1, delta2, rtt);
+                                let result = parse_timestamp_option(options.three_timestamps, data)
+                                    .unwrap_or_else(|e| {
+                                        eprintln!("Failed to parse timestamp option: {}", e);
+                                        ClockDiffResult::default()
+                                    });
+                                let _res =
+                                    sum_result.calculate_delta(options.ip_timestamp, &result);
                             }
                         });
                     }
@@ -334,7 +358,8 @@ fn clockdiff_run(
             Err(e) => return Err(Box::new(e)),
         }
     }
-    sumResult.print_summary();
+    sum_result.measure_delta = (sum_result.min1 - sum_result.min2) / 2;
+    sum_result.print_summary();
     Ok(())
 }
 
@@ -388,13 +413,13 @@ fn build_icmp_timestamp_packet(
 
     // 构造 ICMP 时间戳请求（Type 13）
     let icmp_start = IPV4_HEADER_LEN;
-    let mut icmp_buffer = &mut buffer[icmp_start..];
+    let icmp_buffer = &mut buffer[icmp_start..];
     let mut icmp_packet = MutableIcmpPacket::new(icmp_buffer)
         .ok_or_else(|| anyhow::anyhow!("Failed to create mutable ICMP packet"))?;
     icmp_packet.set_icmp_type(IcmpTypes::Timestamp);
     icmp_packet.set_icmp_code(IcmpCode::new(0));
 
-    let mut timestamp = get_timestamp();
+    let timestamp = get_timestamp();
     let mut payload = vec![0u8; TIMESTAMP_LEN + 4];
     debug!("send timestamp: {:?}", timestamp);
     payload[0..2].copy_from_slice(&id.to_be_bytes());
@@ -434,25 +459,9 @@ fn parse_timestamps(payload: &[u8]) -> Result<ClockDiffResult, Box<dyn std::erro
     })
 }
 
-fn calculate_delta(res: &ClockDiffResult) -> (i64, i64) {
-    let t1 = res.local_send_time;
-    let t2 = res.remote_recv_time;
-    let t3 = res.remote_send_time;
-    let t4 = res.local_recv_time;
-
-    let delta1 = t2 - t1; // 正向延迟
-    let delta2 = t4 - t3; // 反向延迟
-    (delta1, delta2)
-}
-
-fn calculate_rtt(res: &ClockDiffResult) -> i64 {
-    let t1 = res.local_send_time;
-    let t2 = res.remote_recv_time;
-    let t3 = res.remote_send_time;
-    let t4 = res.local_recv_time;
-
-    (t4 - t1) - (t3 - t2)
-}
+const BIASP: i64 = 43199999; //
+const BIASN: i64 = -43200000; // 反向偏移阈值（-12小时）
+const MODULO: i64 = 86400000; // 模数（
 
 fn build_ipv4_packet_with_timestamp(
     options: &mut ClockdiffConfig,
@@ -495,6 +504,12 @@ fn build_ipv4_packet_with_timestamp(
     options[16..20].copy_from_slice(&[0u8; 4]); // 接收时间
     options[20..24].copy_from_slice(&source.octets());
     options[24..28].copy_from_slice(&[0u8; 4]); // 传输时间（初始为0，等待目标主机填充）
+    if option_len == OPTIONS_LEN {
+        options[20..24].copy_from_slice(&dest.octets());
+        options[24..28].copy_from_slice(&[0u8; 4]); // 传输时间（初始为0，等待目标主机填充）
+        options[28..32].copy_from_slice(&source.octets());
+        options[32..36].copy_from_slice(&[0u8; 4]); // 传输时间（初始为0，等待目标主机填充）
+    }
 
     // 计算 IP 头校验和
     ip_packet.set_checksum(0);
@@ -516,7 +531,10 @@ fn build_ipv4_packet_with_timestamp(
     ip_buffer
 }
 
-fn parse_timestamp_option(option_data: &[u8]) -> (i64, i64, i64) {
+fn parse_timestamp_option(
+    three_timestamps: bool,
+    option_data: &[u8],
+) -> Result<ClockDiffResult, Box<dyn std::error::Error>> {
     if option_data.len() < 4 {
         eprintln!("Invalid timestamp option: too short");
     }
@@ -527,6 +545,9 @@ fn parse_timestamp_option(option_data: &[u8]) -> (i64, i64, i64) {
     let overflow = (flags >> 4) & 0x0F; // 溢出计数器
     let flag = flags & 0x0F; // 标志位（0x01=仅时间戳）
 
+    if flag != 3 {
+        return Err(format!("Unsupported timestamp option flag: 0x{:x}", flag).into());
+    }
     debug!("Timestamp Option:");
     debug!("  Length: {} bytes", length);
     debug!("  Pointer: {}", pointer);
@@ -534,50 +555,29 @@ fn parse_timestamp_option(option_data: &[u8]) -> (i64, i64, i64) {
 
     // 时间戳数据解析（从第4字节开始）
     let timestamp_data = &option_data[4..];
-    let timestamps: Vec<u32> = timestamp_data
-        .chunks(4)
-        .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
+    let (t1, t2, t3, t4) = if three_timestamps {
+        let t1 = u32::from_be_bytes(timestamp_data[4..8].try_into()?) as i64;
+        let t2 = u32::from_be_bytes(timestamp_data[12..16].try_into()?) as i64;
+        let t3 = t2;
+        let t4 = u32::from_be_bytes(timestamp_data[20..24].try_into()?) as i64;
+        (t1, t2, t3, t4)
+    } else {
+        let t1 = u32::from_be_bytes(timestamp_data[4..8].try_into()?) as i64;
+        let t2 = u32::from_be_bytes(timestamp_data[12..16].try_into()?) as i64;
+        let t3 = u32::from_be_bytes(timestamp_data[20..24].try_into()?) as i64;
+        let t4 = u32::from_be_bytes(timestamp_data[28..32].try_into()?) as i64;
+        (t1, t2, t3, t4)
+    };
 
-    match flag {
-        0x01 => {
-            // 仅包含发起时间戳
-            if !timestamps.is_empty() {
-                debug!("  Origin Timestamp: {} ms", timestamps[0]);
-            }
-            (0, 0, 0)
-        }
-        0x03 => {
-            // 包含发起、接收、传输时间戳
-            if timestamps.len() >= 3 {
-                debug!("Timestamp: {:?} ", timestamps);
-                let t1 = timestamps[1] as i64;
-                let t2 = timestamps[3] as i64;
-                let t3 = timestamps[5] as i64;
-                let t4 = get_timestamp() as i64;
+    debug!("  Origin Timestamp: {} ms", t1);
+    debug!("  Receive Timestamp: {} ms", t2);
+    debug!("  Transmit Timestamp: {} ms", t3);
+    debug!("  Local Timestamp: {} ms", t4);
 
-                debug!("  Origin Timestamp: {} ms", t1);
-                debug!("  Receive Timestamp: {} ms", t2);
-                debug!("  Transmit Timestamp: {} ms", t3);
-                debug!("  Local Timestamp: {} ms", t4);
-
-                let rtt = t4 - t1; // 往返时间
-                let delta1 = t2 - t1; // 时钟差1
-                let delta2 = if t3 == 0 {
-                    // 未收到时间戳，使用 T3=T2
-                    t4 - t2
-                } else {
-                    t4 - t3
-                };
-
-                return (rtt, delta1, delta2);
-            }
-            debug!("timestamps: {:?}", timestamps);
-            (0, 0, 0)
-        }
-        _ => {
-            eprintln!("Unknown timestamp flag: 0x{:x}", flag);
-            (0, 0, 0)
-        }
-    }
+    Ok(ClockDiffResult {
+        local_send_time: t1,
+        remote_recv_time: t2,
+        remote_send_time: t3,
+        local_recv_time: t4,
+    })
 }
